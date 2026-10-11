@@ -1,20 +1,132 @@
 import asyncio
+import functools
 import os
+from collections.abc import Callable
+from datetime import datetime
 from typing import TYPE_CHECKING, Any, cast
+from xml.etree.ElementTree import Element, fromstring, tostring
 
+from aiobotocore.parsers import AioResponseParserFactory, AioRestXMLParser
+from aiobotocore.session import AioSession
+from botocore import handlers
 from botocore.exceptions import NoCredentialsError
+from botocore.model import Shape
+from botocore.utils import parse_timestamp
 from fsspec.asyn import get_loop, sync
 from s3fs import S3FileSystem
 
 from datachain.lib.file import File
 from datachain.progress import tqdm
 
-from .fsspec import DELIMITER, BucketStatus, Client, ResultQueue
+from .fsspec import DELIMITER, BucketStatus, Client, ResultQueue, iso_timestamp
 
 if TYPE_CHECKING:
     from datachain.client.writeconfig import WriteConfig
 
 UPDATE_CHUNKSIZE = 1000
+
+
+def _parse_timestamp(value: Any) -> datetime:
+    parsed = iso_timestamp(value) if isinstance(value, str) else None
+    return parsed or parse_timestamp(value)
+
+
+_NS = "{http://s3.amazonaws.com/doc/2006-03-01/}"
+_LISTINGS = ("ListObjectsV2Output", "ListObjectVersionsOutput")
+_LISTING_OPS = ("ListObjectsV2", "ListObjectVersions")
+
+
+_SCALARS: dict[str, Callable[[str], Any]] = {
+    "integer": int,
+    "long": int,
+    "boolean": lambda text: text == "true",
+    "timestamp": _parse_timestamp,
+}
+Fields = dict[str, tuple[str, Callable[[Element], Any], bool]]
+
+
+@functools.cache
+def _fields(shape: Shape) -> Fields:
+    """Readers of a structure's child elements by XML tag."""
+    fields = {}
+    for name, member in shape.members.items():
+        repeated = member.type_name == "list"
+        fields[member.serialization.get("name", name)] = (
+            name,
+            _reader(member.member if repeated else member),
+            repeated,
+        )
+    return fields
+
+
+def _reader(shape: Shape) -> Callable[[Element], Any]:
+    if shape.type_name == "structure":
+        return lambda node: _read(node, _fields(shape))
+    convert = _SCALARS.get(shape.type_name, str)
+    return lambda node: convert(node.text or "")
+
+
+def _read(node: Element, fields: Fields) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    for child in node:
+        if field := fields.get(child.tag.removeprefix(_NS)):
+            key, read, repeated = field
+            if repeated:
+                out.setdefault(key, []).append(read(child))
+            else:
+                out[key] = read(child)
+    return out
+
+
+class _ListingParser(AioRestXMLParser):
+    """Reads object listing entries straight from the XML, skipping botocore's
+    model walk."""
+
+    async def parse(self, response, shape):
+        if (
+            response["status_code"] != 200
+            or getattr(shape, "name", "") not in _LISTINGS
+        ):
+            return await super().parse(response, shape)
+        fields = {t: f for t, f in _fields(shape).items() if f[2]}
+        root = fromstring(response["body"])  # noqa: S314
+        entries = _read(root, fields)
+        for node in [n for n in root if n.tag.removeprefix(_NS) in fields]:
+            root.remove(node)
+        parsed = await super().parse({**response, "body": tostring(root)}, shape)
+        return parsed | entries
+
+
+class _ParserFactory(AioResponseParserFactory):
+    def create_parser(self, protocol_name):
+        if protocol_name == "rest-xml":
+            return _ListingParser(**self._defaults)
+        return super().create_parser(protocol_name)
+
+
+def _handle_200_error(operation_model, response_dict, **kwargs) -> None:
+    """botocore's check, but a listing body is not parsed twice: only its end tag."""
+    if getattr(operation_model, "name", "") not in _LISTING_OPS:
+        handlers._handle_200_error(operation_model, response_dict, **kwargs)
+    elif (
+        response_dict
+        and response_dict["status_code"] == 200
+        and not response_dict["body"].rstrip().endswith(b"Result>")
+    ):
+        response_dict["status_code"] = 500
+
+
+@functools.cache
+def _session(profile: str | None) -> AioSession:
+    """One per profile, so fsspec reuses filesystem instances."""
+    session = AioSession(profile=profile)
+    factory = _ParserFactory()
+    factory.set_parser_defaults(timestamp_parser=_parse_timestamp)
+    session.register_component("response_parser_factory", factory)
+    # avoid parsing every listing page twice
+    session.unregister("before-parse.s3.*", handlers._handle_200_error)
+    session.register("before-parse.s3.*", _handle_200_error)
+    return session
 
 
 class ClientS3(Client):
@@ -50,6 +162,9 @@ class ClientS3(Client):
 
         if "region_name" in kwargs:
             kwargs["config_kwargs"].setdefault("region_name", kwargs.pop("region_name"))
+
+        if "session" not in kwargs:
+            kwargs["session"] = _session(kwargs.pop("profile", None))
 
         # remove this `if` when https://github.com/fsspec/s3fs/pull/929 lands
         if not os.environ.get("AWS_REGION") and not os.environ.get("AWS_ENDPOINT_URL"):

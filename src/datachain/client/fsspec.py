@@ -9,7 +9,7 @@ import re
 import shutil
 from abc import ABC, abstractmethod
 from collections.abc import AsyncIterator, Iterator, Sequence
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from datetime import datetime
 from typing import TYPE_CHECKING, Any, BinaryIO, ClassVar, Literal, NamedTuple
 from urllib.parse import urlparse
@@ -39,6 +39,7 @@ FETCH_WORKERS = 100
 DELIMITER = "/"  # Path delimiter.
 
 DATA_SOURCE_URI_PATTERN = re.compile(r"^[\w]+:\/\/.*$")
+FRACTION = re.compile(r"(?<=\.)\d+")
 CLOUD_STORAGE_PROTOCOLS = {"s3", "gs", "az", "hf"}
 
 ResultQueue = asyncio.Queue[Sequence["File"] | None]
@@ -64,6 +65,18 @@ class BucketStatus(NamedTuple):
     exists: bool
     access: Literal["anonymous", "authenticated", "denied"]
     error: str | None = None
+
+
+def iso_timestamp(value: str) -> datetime | None:
+    """ISO 8601 timestamp, parsed without dateutil."""
+    value = value.replace("Z", "+00:00")
+    with suppress(ValueError):
+        return datetime.fromisoformat(value)
+    with suppress(ValueError):  # Python 3.10 takes only 3 or 6 fraction digits
+        return datetime.fromisoformat(
+            FRACTION.sub(lambda m: m[0][:6].ljust(6, "0"), value, 1)
+        )
+    return None
 
 
 class Client(ABC):
