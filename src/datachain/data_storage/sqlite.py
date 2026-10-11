@@ -889,6 +889,8 @@ class SQLiteWarehouse(AbstractWarehouse):
 
         select_ids = query.with_only_columns(col_id)
         ids = self.db.execute(select_ids).fetchall()
+        # binding thousands of ids per batch dominates the copy: a batch that is
+        # a whole range of ids is copied as that range
 
         if preserve_sys_ids:
             select_q = query.offset(None).limit(None)
@@ -903,7 +905,11 @@ class SQLiteWarehouse(AbstractWarehouse):
 
         for batch in batched_it(ids, self.INSERT_BATCH_SIZE):
             batch_ids = [row[0] for row in batch]
-            select_q._where_criteria = (col_id.in_(batch_ids),)
+            low, high = min(batch_ids), max(batch_ids)
+            if high - low + 1 == len(batch_ids) == len(set(batch_ids)):
+                select_q._where_criteria = (col_id.between(low, high),)
+            else:
+                select_q._where_criteria = (col_id.in_(batch_ids),)
             q = table.insert().from_select(list(select_q.selected_columns), select_q)
 
             self.db.execute(q)

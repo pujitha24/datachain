@@ -1,4 +1,5 @@
 import contextlib
+import functools
 import hashlib
 import logging
 import os
@@ -450,6 +451,14 @@ class Subtract(DatasetDiffOperation):
         )
 
 
+@functools.cache
+def _keeps_exact_types(warehouse_type: type["AbstractWarehouse"]) -> bool:
+    """Whether the warehouse converts values of the column's exact type as they are."""
+    from datachain.data_storage.warehouse import AbstractWarehouse
+
+    return warehouse_type.convert_type is AbstractWarehouse.convert_type
+
+
 def adjust_outputs(
     warehouse: "AbstractWarehouse",
     row: dict[str, Any],
@@ -482,6 +491,14 @@ def adjust_outputs(
         # Fill explicit None values with defaults
         if row_val is None:
             row[col_name] = default_value
+            continue
+
+        if (
+            type(row_val) is col_python_type
+            and col_python_type not in (list, dict)
+            and col_type_name != "JSON"
+            and _keeps_exact_types(type(warehouse))
+        ):
             continue
 
         # Validate and convert type if needed and possible
