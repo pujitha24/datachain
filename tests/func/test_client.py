@@ -146,7 +146,7 @@ def test_scandir_ranges_see_past_unlisted_keys(client, tree, mocker):
 
     async def counted(self, prefix, start_after, keep, hi=None):
         nonlocal pages
-        async for page in pages_after(self, prefix, start_after, keep, hi):
+        async for page in pages_after(self, prefix, start_after, keep, hi=hi):
             pages += 1
             yield page
 
@@ -168,7 +168,7 @@ def test_scandir_builds_no_files_past_range_ends(client, tree, mocker):
     async def counted(self, prefix, start_after, keep, hi=None):
         nonlocal ranges, files
         ranges += 1
-        async for page in pages_after(self, prefix, start_after, keep, hi):
+        async for page in pages_after(self, prefix, start_after, keep, hi=hi):
             files += len(page[0])
             yield page
 

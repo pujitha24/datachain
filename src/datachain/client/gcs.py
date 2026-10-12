@@ -225,6 +225,7 @@ class GCSClient(Client):
         prefix: str,
         start_after: str,
         keep: Callable[[str], bool],
+        page_size: int | None = None,
         hi: str | None = None,
     ) -> AsyncGenerator[Page, None]:
         token = None
@@ -237,7 +238,7 @@ class GCSClient(Client):
                 prefix=prefix,
                 startOffset=start_after or None,
                 endOffset=None if hi is None else f"{hi}\0",  # exclusive
-                maxResults=self.LIST_PAGE_SIZE,
+                maxResults=page_size or self.LIST_PAGE_SIZE,
                 pageToken=token,
                 json_out=True,
                 versions="true" if self._is_version_aware() else "false",

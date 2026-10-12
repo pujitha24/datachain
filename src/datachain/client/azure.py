@@ -267,6 +267,7 @@ class AzureClient(Client):
         prefix: str,
         start_after: str,
         keep: Callable[[str], bool],
+        page_size: int | None = None,
         hi: str | None = None,
     ) -> AsyncGenerator[Page, None]:
         kwargs = {"start_from": start_after} if start_after else {}
@@ -277,7 +278,7 @@ class AzureClient(Client):
             pages = container.list_blob_names(
                 include=["versions"] if self._is_version_aware() else None,
                 name_starts_with=prefix,
-                results_per_page=self.LIST_PAGE_SIZE,
+                results_per_page=page_size or self.LIST_PAGE_SIZE,
                 **kwargs,
             ).by_page()
             async for _ in pages:

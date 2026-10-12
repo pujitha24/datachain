@@ -273,6 +273,7 @@ class ClientS3(Client):
         prefix: str,
         start_after: str,
         keep: Callable[[str], bool],
+        page_size: int | None = None,
         hi: str | None = None,
     ) -> AsyncGenerator[Page, None]:
         versions = self._is_version_aware()
@@ -287,7 +288,7 @@ class ClientS3(Client):
         async for page in s3.get_paginator(method).paginate(
             Bucket=self.name,
             Prefix=prefix,
-            PaginationConfig={"PageSize": self.LIST_PAGE_SIZE},
+            PaginationConfig={"PageSize": page_size or self.LIST_PAGE_SIZE},
             **kwargs,
         ):
             entries = page.get(key, [])
