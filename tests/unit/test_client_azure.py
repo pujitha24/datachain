@@ -308,3 +308,42 @@ def test_listing_asks_for_versions_only_when_version_aware(version_aware, includ
     sync(get_loop(), list_all)
 
     assert container.list_blob_names.call_args.kwargs["include"] == include
+
+
+@pytest.mark.parametrize("resource_type", ["", "<ResourceType>file</ResourceType>"])
+def test_hierarchical_namespace_lists_out_of_key_order(resource_type):
+    page = fromstring(  # noqa: S314
+        "<EnumerationResults><Blobs><Blob><Name>a</Name><Properties>"
+        "<Last-Modified>Wed, 30 Sep 2026 23:00:00 GMT</Last-Modified>"
+        f"<Etag>0x8DC</Etag><Content-Length>1</Content-Length>{resource_type}"
+        "</Properties></Blob></Blobs></EnumerationResults>"
+    )
+
+    class Pages:
+        _response = page
+
+        def __aiter__(self):
+            self.done = False
+            return self
+
+        async def __anext__(self):
+            if self.done:
+                raise StopAsyncIteration
+            self.done = True
+            return page
+
+    container = MagicMock()
+    container.__aenter__ = AsyncMock(return_value=container)
+    container.__aexit__ = AsyncMock(return_value=False)
+    container.list_blob_names.return_value.by_page.return_value = Pages()
+    client = AzureClient("mycontainer", {}, MagicMock())
+    client._fs = MagicMock(version_aware=False)
+    client._fs.service_client.get_container_client.return_value = container
+
+    async def list_all():
+        async for _ in client.scandir(""):
+            pass
+
+    sync(get_loop(), list_all)
+
+    assert client._lists_in_key_order() is (not resource_type)

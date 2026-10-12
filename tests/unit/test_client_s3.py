@@ -185,3 +185,10 @@ def test_200_error_check(operation, body, status):
     response = {"status_code": 200, "body": body, "headers": {}}
     _handle_200_error(model.operation_model(operation), response)
     assert response["status_code"] == status
+
+
+@pytest.mark.parametrize(
+    "bucket, in_order", [("bucket", True), ("bucket--usw2-az1--x-s3", False)]
+)
+def test_directory_buckets_list_out_of_key_order(bucket, in_order):
+    assert ClientS3(bucket, {}, None)._lists_in_key_order() is in_order

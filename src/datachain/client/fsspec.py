@@ -8,8 +8,15 @@ import posixpath
 import re
 import shutil
 from abc import ABC, abstractmethod
-from collections.abc import AsyncIterator, Iterator, Sequence
-from contextlib import contextmanager, suppress
+from collections.abc import (
+    AsyncGenerator,
+    AsyncIterator,
+    Callable,
+    Iterable,
+    Iterator,
+    Sequence,
+)
+from contextlib import aclosing, contextmanager, suppress
 from datetime import datetime
 from typing import TYPE_CHECKING, Any, BinaryIO, ClassVar, Literal, NamedTuple
 from urllib.parse import urlparse
@@ -36,18 +43,61 @@ if TYPE_CHECKING:
 logger = logging.getLogger("datachain")
 
 FETCH_WORKERS = 100
+LIST_WORKERS = 4
+SPLIT_PAGES = 4
 DELIMITER = "/"  # Path delimiter.
 
 DATA_SOURCE_URI_PATTERN = re.compile(r"^[\w]+:\/\/.*$")
 FRACTION = re.compile(r"(?<=\.)\d+")
 CLOUD_STORAGE_PROTOCOLS = {"s3", "gs", "az", "hf"}
 
-ResultQueue = asyncio.Queue[Sequence["File"] | None]
+ResultQueue = asyncio.Queue[Sequence["File"]]
+Page = tuple[list["File"], str | None]  # files and the last key listed
 
 
 def is_cloud_uri(uri: str) -> bool:
     protocol = urlparse(uri).scheme
     return protocol in CLOUD_STORAGE_PROTOCOLS
+
+
+def iso_timestamp(value: str) -> datetime | None:
+    """ISO 8601 timestamp, parsed without dateutil."""
+    value = value.replace("Z", "+00:00")
+    with suppress(ValueError):
+        return datetime.fromisoformat(value)
+    with suppress(ValueError):  # Python 3.10 takes only 3 or 6 fraction digits
+        return datetime.fromisoformat(
+            FRACTION.sub(lambda m: m[0][:6].ljust(6, "0"), value, 1)
+        )
+    return None
+
+
+def key_midpoint(
+    lo: str, hi: str | None, alphabet: Iterable[str], first: str | None = None
+) -> str | None:
+    """Shortest key strictly between ``lo`` and ``hi`` (``None`` is the open end);
+    with ``first``, at most ``SPLIT_PAGES`` pages of ``first..lo`` past ``lo``."""
+    chars = sorted(set(alphabet) | set(lo) | set(hi or "") | set(first or ""))
+    digit = {c: i + 1 for i, c in enumerate(chars)}
+    base = len(chars) + 1
+    width = max(len(lo), len(hi or ""), len(first or "")) + 1
+
+    def value(key: str) -> int:
+        n = 0
+        for i in range(width):
+            n = n * base + (digit[key[i]] if i < len(key) else 0)
+        return n
+
+    n = (value(lo) + (base**width if hi is None else value(hi))) // 2
+    if first is not None and first < lo:
+        n = min(n, value(lo) + (value(lo) - value(first)) * SPLIT_PAGES)
+    digits = []
+    for _ in range(width):
+        n, d = divmod(n, base)
+        digits.append(chars[max(d - 1, 0)])
+    mid = "".join(reversed(digits))
+    mid = next((mid[:k] for k in range(1, len(mid) + 1) if mid[:k] > lo), mid)
+    return mid if lo < mid and (hi is None or mid < hi) else None
 
 
 def get_cloud_schemes() -> list[str]:
@@ -67,18 +117,6 @@ class BucketStatus(NamedTuple):
     error: str | None = None
 
 
-def iso_timestamp(value: str) -> datetime | None:
-    """ISO 8601 timestamp, parsed without dateutil."""
-    value = value.replace("Z", "+00:00")
-    with suppress(ValueError):
-        return datetime.fromisoformat(value)
-    with suppress(ValueError):  # Python 3.10 takes only 3 or 6 fraction digits
-        return datetime.fromisoformat(
-            FRACTION.sub(lambda m: m[0][:6].ljust(6, "0"), value, 1)
-        )
-    return None
-
-
 class Client(ABC):
     MAX_THREADS = multiprocessing.cpu_count()
     FS_CLASS: ClassVar[type["AbstractFileSystem"]]
@@ -86,6 +124,7 @@ class Client(ABC):
     protocol: ClassVar[str]
     # client_config keys this backend treats as credentials.
     CREDENTIAL_KEYS: ClassVar[frozenset[str]] = frozenset()
+    LIST_PAGE_SIZE: ClassVar[int] = 1000
 
     @classmethod
     def has_explicit_credentials(cls, client_config: dict | None) -> bool:
@@ -310,12 +349,27 @@ class Client(ABC):
             impl = getattr(self, f"_fetch_{method}")
         except AttributeError:
             raise ValueError(f"Unknown indexing method '{method}'") from None
-        result_queue: ResultQueue = asyncio.Queue()
-        loop = get_loop()
-        main_task = loop.create_task(impl(start_prefix, result_queue))
-        while (entry := await result_queue.get()) is not None:
-            yield entry
-        await main_task
+        result_queue: ResultQueue = asyncio.Queue(2 * LIST_WORKERS)
+        main_task = get_loop().create_task(impl(start_prefix, result_queue))
+        get: asyncio.Future | None = None
+        try:
+            while not main_task.done():
+                get = asyncio.ensure_future(result_queue.get())
+                await asyncio.wait(
+                    [get, main_task], return_when=asyncio.FIRST_COMPLETED
+                )
+                if get.done():
+                    yield get.result()
+                else:
+                    get.cancel()
+            while not result_queue.empty():
+                yield result_queue.get_nowait()
+            await main_task
+        finally:
+            pending = [main_task] if get is None else [main_task, get]
+            for task in pending:
+                task.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
 
     async def _fetch_nested(self, start_prefix: str, result_queue: ResultQueue) -> None:
         progress_bar = tqdm(desc=f"Listing {self.uri}", unit=" objects", leave=False)
@@ -340,26 +394,98 @@ class Client(ABC):
                 finally:
                     queue.task_done()
 
+        workers: list[asyncio.Task] = []
         try:
-            workers: list[asyncio.Task] = [
-                loop.create_task(process(queue)) for _ in range(FETCH_WORKERS)
-            ]
-
-            # Wait for all fetch tasks to complete
+            workers = [loop.create_task(process(queue)) for _ in range(FETCH_WORKERS)]
             await queue.join()
-            # Stop the workers
-            excs = []
             for worker in workers:
                 if worker.done() and (exc := worker.exception()):
-                    excs.append(exc)
-                else:
-                    worker.cancel()
-            if excs:
-                raise excs[0]
+                    raise exc
         finally:
-            # This ensures the progress bar is closed before any exceptions are raised
+            for worker in workers:
+                worker.cancel()
+            await asyncio.gather(*workers, return_exceptions=True)
             progress_bar.close()
-            result_queue.put_nowait(None)
+
+    async def _fetch_ranges(self, start_prefix: str, result_queue: ResultQueue) -> None:
+        """List key ranges ``(lo, hi]`` in parallel; while a worker is idle, a
+        busy range hands over its upper half, split at a key midpoint."""
+        prefix = start_prefix.lstrip(DELIMITER) + DELIMITER if start_prefix else ""
+        queue: asyncio.Queue[tuple[str, str | None]] = asyncio.Queue()
+        queue.put_nowait(("", None))
+        alphabet: set[str] = set()
+        open_ranges, found, seeks = 1, False, True
+        pbar = tqdm(desc=f"Listing {self.uri}", unit=" objects", leave=False)
+
+        async def read(lo: str, hi: str | None) -> None:
+            nonlocal open_ranges, found, seeks
+            can_split = bool(lo)  # a one-page listing stays one request
+
+            def keep(key: str) -> bool:
+                return self._is_valid_key(key) and (hi is None or key <= hi)
+
+            async with aclosing(self._pages_after(prefix, lo, keep, hi)) as pages:
+                async for files, last in pages:
+                    first = files[0].path if files else None
+                    if first is not None and first < lo:  # the server ignores the start
+                        seeks = False
+                    files = [f for f in files if lo < f.path]
+                    if files:
+                        await result_queue.put(files)
+                        pbar.update(len(files))
+                    found = found or last is not None
+                    if last is None or last <= lo:
+                        continue
+                    alphabet.update(last)
+                    if hi is not None and last > hi:
+                        return
+                    ordered = seeks and self._lists_in_key_order()
+                    if can_split and ordered and open_ranges < LIST_WORKERS:
+                        mid = key_midpoint(last, hi, alphabet, first)
+                        if mid is not None:
+                            queue.put_nowait((mid, hi))
+                            open_ranges += 1
+                            hi = mid
+                    can_split = True
+
+        async def worker() -> None:
+            nonlocal open_ranges
+            while True:
+                lo, hi = await queue.get()
+                try:
+                    await read(lo, hi)
+                finally:
+                    open_ranges -= 1
+                    queue.task_done()
+
+        workers = [asyncio.create_task(worker()) for _ in range(LIST_WORKERS)]
+        done = asyncio.create_task(queue.join())
+        try:
+            await asyncio.wait([done, *workers], return_when=asyncio.FIRST_COMPLETED)
+            if failed := next((w for w in workers if w.done()), None):
+                await failed
+            if not found and prefix:
+                raise FileNotFoundError(f"Unable to resolve remote path: {prefix}")
+        finally:
+            for task in [done, *workers]:
+                task.cancel()
+            await asyncio.gather(done, *workers, return_exceptions=True)
+            pbar.close()
+
+    def _lists_in_key_order(self) -> bool:
+        return True
+
+    def _pages_after(
+        self,
+        prefix: str,
+        start_after: str,
+        keep: Callable[[str], bool],
+        hi: str | None = None,
+    ) -> AsyncGenerator[Page, None]:
+        """Pages under ``prefix`` after ``start_after``, in key order; only keys to
+        ``keep`` become files. A backend that can end a listing at a key ends it
+        after ``hi``."""
+        raise NotImplementedError
 
     async def _fetch_default(
         self, start_prefix: str, result_queue: ResultQueue

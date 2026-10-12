@@ -238,3 +238,20 @@ def test_iter_over_async_empty():
 
     res = iter_over_async(gen(), get_loop())
     assert list(res) == []
+
+
+def test_iter_over_async_closes_the_iterator_it_stops_early():
+    closed = []
+
+    async def numbers():
+        try:
+            for i in range(10):
+                yield i
+        finally:
+            closed.append(True)
+
+    it = iter_over_async(numbers(), get_loop())
+    assert next(it) == 0
+    it.close()
+
+    assert closed == [True]

@@ -1,6 +1,7 @@
 import asyncio
 import os
 import sys
+from contextlib import aclosing
 from datetime import UTC
 from pathlib import Path
 from uuid import uuid4
@@ -70,6 +71,155 @@ def test_scandir_not_dir(client):
 def test_scandir_success(client):
     results = scandir(client, "")
     match_entries(results, ENTRIES)
+
+
+def _paths(tree, prefix=""):
+    for name, value in tree.items():
+        if isinstance(value, dict):
+            yield from _paths(value, f"{prefix}{name}/")
+        else:
+            yield prefix + name
+
+
+RANGE_TREES = {
+    "skewed": {"a": "1", "big": {f"{i:03}": "x" for i in range(80)}, "z": "1"},
+    "flat": {f"{i * 7919 % 4096:03x}": "x" for i in range(80)},
+    "siblings": {"a": {"b": "x"}, "a-b": "x", "a.c": "x", "a0": "x", "ab": {"c": "x"}},
+}
+
+
+@pytest.mark.parametrize("cloud_type", ["s3", "gs", "azure"], indirect=True)
+@pytest.mark.parametrize(
+    "tree", list(RANGE_TREES.values()), ids=list(RANGE_TREES), indirect=True
+)
+@pytest.mark.parametrize("prefix", ["", "big"])
+def test_scandir_ranges_are_exact(client, tree, prefix, mocker):
+    mocker.patch.object(type(client), "LIST_PAGE_SIZE", 4)
+    mocker.patch("datachain.client.fsspec.LIST_WORKERS", 3)
+    ranges = mocker.spy(client, "_pages_after")
+    expected = [p for p in _paths(tree) if p.startswith(prefix)]
+    if not expected:
+        with pytest.raises(FileNotFoundError):
+            scandir(client, prefix)
+        return
+
+    paths = [e.path for e in scandir(client, prefix)]
+
+    assert sorted(paths) == sorted(expected)
+    assert ranges.call_count > 1
+
+
+@pytest.mark.parametrize("cloud_type", ["s3", "gs", "azure"], indirect=True)
+@pytest.mark.parametrize("tree", [RANGE_TREES["flat"]], indirect=True)
+def test_scandir_stops_listing_when_closed_early(client, tree, mocker):
+    mocker.patch.object(type(client), "LIST_PAGE_SIZE", 4)
+
+    async def first_page():
+        async with aclosing(client.scandir("")) as entries:
+            async for page in entries:
+                return page
+
+    async def pending_listing_tasks():
+        tasks = [
+            t for t in asyncio.all_tasks() if "_fetch" in t.get_coro().__qualname__
+        ]
+        if tasks:
+            await asyncio.wait(tasks, timeout=5)
+        return [t for t in tasks if not t.done()]
+
+    assert sync(get_loop(), first_page)
+    assert not sync(get_loop(), pending_listing_tasks)
+
+
+UNLISTED_TREE = {"a": {f"{i:02}": "x" for i in range(40)}, "z": {"0": "x"}}
+
+
+@pytest.mark.parametrize("cloud_type", ["s3", "gs", "azure"], indirect=True)
+@pytest.mark.parametrize("tree", [UNLISTED_TREE], indirect=True)
+def test_scandir_ranges_see_past_unlisted_keys(client, tree, mocker):
+    for i in range(60):
+        client.fs.pipe_file(f"{client.uri}/m//{i:02}", b"x")
+    mocker.patch.object(type(client), "LIST_PAGE_SIZE", 4)
+    mocker.patch("datachain.client.fsspec.LIST_WORKERS", 3)
+    pages = 0
+    pages_after = type(client)._pages_after
+
+    async def counted(self, prefix, start_after, keep, hi=None):
+        nonlocal pages
+        async for page in pages_after(self, prefix, start_after, keep, hi):
+            pages += 1
+            yield page
+
+    mocker.patch.object(type(client), "_pages_after", counted)
+
+    expected = sorted(_paths(tree))
+    assert sorted(e.path for e in scandir(client, "")) == expected
+    assert pages <= 2 * (len(expected) + 60) // 4
+
+
+@pytest.mark.parametrize("cloud_type", ["s3", "gs"], indirect=True)
+@pytest.mark.parametrize("tree", [RANGE_TREES["flat"]], indirect=True)
+def test_scandir_builds_no_files_past_range_ends(client, tree, mocker):
+    mocker.patch.object(type(client), "LIST_PAGE_SIZE", 4)
+    mocker.patch("datachain.client.fsspec.LIST_WORKERS", 3)
+    ranges = files = 0
+    pages_after = type(client)._pages_after
+
+    async def counted(self, prefix, start_after, keep, hi=None):
+        nonlocal ranges, files
+        ranges += 1
+        async for page in pages_after(self, prefix, start_after, keep, hi):
+            files += len(page[0])
+            yield page
+
+    mocker.patch.object(type(client), "_pages_after", counted)
+
+    assert len(scandir(client, "")) == len(tree)
+    assert ranges > 1
+    assert files <= len(tree) + ranges  # GCS startOffset includes the start key
+
+
+@pytest.mark.parametrize("cloud_type", ["gs"], indirect=True)
+@pytest.mark.parametrize("tree", [RANGE_TREES["flat"]], indirect=True)
+def test_gcs_listing_ends_at_hi(client, tree, mocker):
+    mocker.patch.object(type(client), "LIST_PAGE_SIZE", 4)
+    keys = sorted(tree)
+    lo, hi = keys[10], keys[20]
+    read = []
+    call = client.fs._call
+
+    async def counted(*args, **kwargs):
+        page = await call(*args, **kwargs)
+        read.extend(item["name"] for item in page.get("items", []))
+        return page
+
+    mocker.patch.object(client.fs, "_call", counted)
+
+    async def listed():
+        return [f async for f, _ in client._pages_after("", lo, lambda _: True, hi=hi)]
+
+    sync(get_loop(), listed)
+    assert read == keys[10:21]  # startOffset includes the start key
+
+
+@pytest.mark.parametrize("cloud_type", ["s3", "gs", "azure"], indirect=True)
+@pytest.mark.parametrize("tree", [RANGE_TREES["flat"]], indirect=True)
+def test_scandir_out_of_key_order_is_one_range(client, tree, mocker):
+    mocker.patch.object(type(client), "LIST_PAGE_SIZE", 4)
+    mocker.patch.object(type(client), "_lists_in_key_order", return_value=False)
+    ranges = mocker.spy(client, "_pages_after")
+
+    paths = [e.path for e in scandir(client, "")]
+
+    assert sorted(paths) == sorted(_paths(tree))
+    assert ranges.call_count == 1
+
+
+@pytest.mark.parametrize("cloud_type", ["s3", "gs", "azure"], indirect=True)
+def test_scandir_one_page_is_one_range(client, mocker):
+    ranges = mocker.spy(client, "_pages_after")
+    assert scandir(client, "")
+    assert ranges.call_count == 1
 
 
 @pytest.mark.parametrize("cloud_type", ["s3", "gs"], indirect=True)

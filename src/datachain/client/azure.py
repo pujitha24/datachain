@@ -1,5 +1,5 @@
 import shutil
-from collections.abc import Iterator
+from collections.abc import AsyncGenerator, Callable, Iterator
 from contextlib import contextmanager
 from email.utils import parsedate_to_datetime
 from tempfile import SpooledTemporaryFile
@@ -18,9 +18,8 @@ from azure.storage.blob import BlobServiceClient
 from fsspec.asyn import get_loop, sync
 
 from datachain.lib.file import File
-from datachain.progress import tqdm
 
-from .fsspec import DELIMITER, BucketStatus, Client, ResultQueue
+from .fsspec import BucketStatus, Client, Page
 
 if TYPE_CHECKING:
     from datachain.client.writeconfig import WriteConfig
@@ -48,6 +47,7 @@ class AzureClient(Client):
     FS_CLASS = AzureBlobFileSystem
     PREFIX = "az://"
     protocol = "az"
+    LIST_PAGE_SIZE = 5000
     CREDENTIAL_KEYS = frozenset(
         {
             "account_key",
@@ -255,40 +255,42 @@ class AzureClient(Client):
             lpath = f"{lpath}?versionid={version_id}"
         await self.fs._get_file(lpath, rpath, callback=callback)
 
-    async def _fetch_flat(self, start_prefix: str, result_queue: ResultQueue) -> None:
-        prefix = start_prefix
-        if prefix:
-            prefix = prefix.lstrip(DELIMITER) + DELIMITER
-        found = False
-        include = ["versions"] if self._is_version_aware() else None
-        try:
-            with tqdm(desc=f"Listing {self.uri}", unit=" objects", leave=False) as pbar:
-                async with self.fs.service_client.get_container_client(
-                    container=self.name
-                ) as container_client:
-                    # raw page XML: the SDK's deserializer is most of the listing's CPU
-                    pages = container_client.list_blob_names(
-                        include=include, name_starts_with=prefix
-                    ).by_page()
-                    async for _ in pages:
-                        blobs = pages._response.find("Blobs").findall("Blob")
-                        found = found or bool(blobs)
-                        entries = [
-                            self._xml_to_file(b, name)
-                            for b in blobs
-                            if self._is_valid_key(name := self._blob_name(b))
-                        ]
-                        if entries:
-                            await result_queue.put(entries)
-                            pbar.update(len(entries))
-                    if not found and prefix:
-                        raise FileNotFoundError(
-                            f"Unable to resolve remote path: {prefix}"
-                        )
-        finally:
-            result_queue.put_nowait(None)
+    _fetch_default = _fetch_flat = Client._fetch_ranges
+    _hns = False
 
-    _fetch_default = _fetch_flat
+    def _lists_in_key_order(self) -> bool:
+        # a hierarchical namespace lists "/" before every other character
+        return not self._hns
+
+    async def _pages_after(
+        self,
+        prefix: str,
+        start_after: str,
+        keep: Callable[[str], bool],
+        hi: str | None = None,
+    ) -> AsyncGenerator[Page, None]:
+        kwargs = {"start_from": start_after} if start_after else {}
+        async with self.fs.service_client.get_container_client(
+            container=self.name
+        ) as container:
+            # raw page XML: the SDK's deserializer is most of the listing's CPU
+            pages = container.list_blob_names(
+                include=["versions"] if self._is_version_aware() else None,
+                name_starts_with=prefix,
+                results_per_page=self.LIST_PAGE_SIZE,
+                **kwargs,
+            ).by_page()
+            async for _ in pages:
+                blobs = pages._response.find("Blobs").findall("Blob")
+                if blobs and blobs[0].find("Properties/ResourceType") is not None:
+                    self._hns = True
+                names = [self._blob_name(b) for b in blobs]
+                files = [
+                    self._xml_to_file(b, n)
+                    for b, n in zip(blobs, names, strict=True)
+                    if keep(n)
+                ]
+                yield files, names[-1] if names else None
 
     @staticmethod
     def _blob_name(blob: Element) -> str:
