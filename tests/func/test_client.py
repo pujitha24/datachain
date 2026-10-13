@@ -15,6 +15,7 @@ from tqdm import tqdm
 
 from datachain.asyn import get_loop
 from datachain.client import Client
+from datachain.client.listing_worker import item_path
 from datachain.lib.file import File, FileError
 from tests.data import ENTRIES
 
@@ -109,6 +110,98 @@ def test_scandir_ranges_are_exact(client, tree, prefix, mocker):
     assert ranges.call_count > 1
 
 
+@pytest.mark.parametrize("cloud_type", ["s3", "gs"], indirect=True)
+@pytest.mark.parametrize("tree", [{f"{i:03}": "x" for i in range(200)}], indirect=True)
+@pytest.mark.parametrize("workers", [2, 16])
+@pytest.mark.parametrize("young_pages", [4, 10**6])
+def test_scandir_old_ranges_split_far_after_a_probe(
+    client, tree, workers, young_pages, mocker
+):
+    # with idle workers every range splits on its first pages; a range split off
+    # another inherits its age, so the listing still turns to far splits
+    mocker.patch.object(type(client), "LIST_PAGE_SIZE", 4)
+    mocker.patch("datachain.client.fsspec.LIST_WORKERS", workers)
+    mocker.patch("datachain.client.fsspec.YOUNG_PAGES", young_pages)
+    calls = mocker.spy(client, "_pages_after")
+
+    assert sorted(e.path for e in scandir(client, "")) == sorted(tree)
+    probes = [c for c in calls.call_args_list if c.kwargs.get("page_size")]
+    assert bool(probes) == (young_pages == 4)
+
+
+@pytest.mark.parametrize("cloud_type", ["s3", "gs", "azure"], indirect=True)
+@pytest.mark.parametrize("tree", [{f"{i:03}": "x" for i in range(200)}], indirect=True)
+def test_scandir_split_past_the_data_opens_no_range(client, tree, cloud_type, mocker):
+    mocker.patch.object(type(client), "LIST_PAGE_SIZE", 4)
+    mocker.patch("datachain.client.fsspec.LIST_WORKERS", 2)
+    calls = mocker.spy(client, "_pages_after")
+
+    assert sorted(e.path for e in scandir(client, "")) == sorted(tree)
+    probes = [c.args[1] for c in calls.call_args_list if c.kwargs.get("page_size")]
+    ranges = [c.args[1] for c in calls.call_args_list if not c.kwargs.get("page_size")]
+    if cloud_type != "azure":  # Azure on the emulator never splits an old range
+        assert probes
+    assert sum(lo > "199" for lo in ranges + probes) <= 4
+
+
+@pytest.mark.parametrize("cloud_type", ["s3", "gs"], indirect=True)
+@pytest.mark.parametrize("tree", [{f"{i:03}": "x" for i in range(200)}], indirect=True)
+@pytest.mark.parametrize("processes", [False, True])
+def test_scandir_is_exact_when_the_reader_is_slow(client, tree, processes, mocker):
+    # pages wait for room in the result queue while split probes come back
+    mocker.patch.object(type(client), "LIST_PAGE_SIZE", 4)
+    mocker.patch("datachain.client.fsspec.LIST_WORKERS", 4)
+
+    async def slow_reader():
+        paths = []
+        async for entries in client.scandir("", processes=processes):
+            paths.extend(item_path(e) for e in entries)
+            await asyncio.sleep(0.02)
+        return paths
+
+    assert sorted(sync(get_loop(), slow_reader)) == sorted(tree)
+
+
+@pytest.mark.parametrize("cloud_type", ["s3"], indirect=True)
+@pytest.mark.parametrize("tree", [{f"{i:03}": "x" for i in range(200)}], indirect=True)
+def test_s3_probes_only_past_an_open_end(client, tree, mocker):
+    mocker.patch.object(type(client), "LIST_PAGE_SIZE", 4)
+    probes = mocker.spy(client, "_probe")
+    opened = []
+    range_pages = type(client)._range_pages
+
+    def spy(self, prefix, lo, bound, pool):
+        opened.append((lo, bound.hi))
+        return range_pages(self, prefix, lo, bound, pool)
+
+    mocker.patch.object(type(client), "_range_pages", spy)
+
+    assert sorted(e.path for e in scandir(client, "")) == sorted(tree)
+    probed = {c.args[1] for c in probes.call_args_list}
+    assert any(hi is not None and lo for lo, hi in opened)
+    assert all(hi is None for lo, hi in opened if lo in probed)
+
+
+def test_bounded_splits_are_probed_with_large_pages_only():
+    from datachain.client.azure import AzureClient
+    from datachain.client.gcs import GCSClient
+    from datachain.client.s3 import ClientS3
+
+    assert not ClientS3.PROBE_BOUNDED_SPLITS
+    assert GCSClient.PROBE_BOUNDED_SPLITS
+    assert AzureClient.PROBE_BOUNDED_SPLITS
+
+
+@pytest.mark.parametrize("cloud_type", ["s3"], indirect=True)
+@pytest.mark.parametrize("version_aware", [True], indirect=True)
+@pytest.mark.parametrize("tree", [{"a": "x", "z": "x"}], indirect=True)
+def test_probe_sees_a_key_behind_a_delete_marker(client, tree):
+    client.fs.rm_file(f"{client.uri}/z")
+
+    assert sync(get_loop(), client._probe, "", "m") == "z"
+    assert sync(get_loop(), client._probe, "", "z") is None
+
+
 @pytest.mark.parametrize("cloud_type", ["s3", "gs", "azure"], indirect=True)
 @pytest.mark.parametrize("tree", [RANGE_TREES["flat"]], indirect=True)
 def test_scandir_stops_listing_when_closed_early(client, tree, mocker):
@@ -144,9 +237,9 @@ def test_scandir_ranges_see_past_unlisted_keys(client, tree, mocker):
     pages = 0
     pages_after = type(client)._pages_after
 
-    async def counted(self, prefix, start_after, keep, hi=None):
+    async def counted(self, prefix, start_after, keep, page_size=None, hi=None):
         nonlocal pages
-        async for page in pages_after(self, prefix, start_after, keep, hi=hi):
+        async for page in pages_after(self, prefix, start_after, keep, page_size, hi):
             pages += 1
             yield page
 
@@ -165,10 +258,10 @@ def test_scandir_builds_no_files_past_range_ends(client, tree, mocker):
     ranges = files = 0
     pages_after = type(client)._pages_after
 
-    async def counted(self, prefix, start_after, keep, hi=None):
+    async def counted(self, prefix, start_after, keep, page_size=None, hi=None):
         nonlocal ranges, files
         ranges += 1
-        async for page in pages_after(self, prefix, start_after, keep, hi=hi):
+        async for page in pages_after(self, prefix, start_after, keep, page_size, hi):
             files += len(page[0])
             yield page
 

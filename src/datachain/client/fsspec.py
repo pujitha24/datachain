@@ -44,8 +44,10 @@ if TYPE_CHECKING:
 logger = logging.getLogger("datachain")
 
 FETCH_WORKERS = 100
-LIST_WORKERS = 4
+LIST_WORKERS = 16
+PROCESS_LIST_WORKERS = 64  # in flight once child processes parse the pages
 SPLIT_PAGES = 4
+YOUNG_PAGES = 4  # splits stay SPLIT_PAGES ahead until a range and its parents read more
 DELIMITER = "/"  # Path delimiter.
 
 DATA_SOURCE_URI_PATTERN = re.compile(r"^[\w]+:\/\/.*$")
@@ -74,10 +76,14 @@ def iso_timestamp(value: str) -> datetime | None:
 
 
 def key_midpoint(
-    lo: str, hi: str | None, alphabet: Iterable[str], first: str | None = None
+    lo: str,
+    hi: str | None,
+    alphabet: Iterable[str],
+    first: str | None = None,
+    pages: int = SPLIT_PAGES,
 ) -> str | None:
     """Shortest key strictly between ``lo`` and ``hi`` (``None`` is the open end);
-    with ``first``, at most ``SPLIT_PAGES`` pages of ``first..lo`` past ``lo``."""
+    with ``first``, at most ``pages`` pages of ``first..lo`` past ``lo``."""
     chars = sorted(set(alphabet) | set(lo) | set(hi or "") | set(first or ""))
     digit = {c: i + 1 for i, c in enumerate(chars)}
     base = len(chars) + 1
@@ -91,7 +97,7 @@ def key_midpoint(
 
     n = (value(lo) + (base**width if hi is None else value(hi))) // 2
     if first is not None and first < lo:
-        n = min(n, value(lo) + (value(lo) - value(first)) * SPLIT_PAGES)
+        n = min(n, value(lo) + (value(lo) - value(first)) * pages)
     digits = []
     for _ in range(width):
         n, d = divmod(n, base)
@@ -126,6 +132,7 @@ class Client(ABC):
     # client_config keys this backend treats as credentials.
     CREDENTIAL_KEYS: ClassVar[frozenset[str]] = frozenset()
     LIST_PAGE_SIZE: ClassVar[int] = 1000
+    PROBE_BOUNDED_SPLITS: ClassVar[bool] = True  # pays off with large pages
 
     @classmethod
     def has_explicit_credentials(cls, client_config: dict | None) -> bool:
@@ -412,30 +419,71 @@ class Client(ABC):
             await asyncio.gather(*workers, return_exceptions=True)
             progress_bar.close()
 
-    async def _fetch_ranges(
+    async def _fetch_ranges(  # noqa: C901, PLR0915
         self, start_prefix: str, result_queue: ResultQueue, processes: bool = False
     ) -> None:
         """List key ranges ``(lo, hi]`` in parallel; while a worker is idle, a
-        busy range hands over its upper half, split at a key midpoint. With
+        busy range hands over its upper half, split at a key midpoint. A young
+        range splits close ahead, so a small listing stays a few requests. With
         ``processes``, a listing longer than a page moves to child processes."""
         from .listing_worker import PROCESSES, Bound, Pool
 
         prefix = start_prefix.lstrip(DELIMITER) + DELIMITER if start_prefix else ""
-        queue: asyncio.Queue[tuple[str, str | None]] = asyncio.Queue()
-        queue.put_nowait(("", None))
+        # (lo, hi, pages read by the ranges this one split off from)
+        queue: asyncio.Queue[tuple[str, str | None, int]] = asyncio.Queue()
+        queue.put_nowait(("", None, 0))
         alphabet: set[str] = set()
         open_ranges, found, seeks = 1, False, True
         pool = Pool(self, PROCESSES) if processes else None
+        in_flight = PROCESS_LIST_WORKERS if pool and pool.size else LIST_WORKERS
+        probes: set[asyncio.Task] = set()
         pbar = tqdm(desc=f"Listing {self.uri}", unit=" objects", leave=False)
 
-        async def read(lo: str, hi: str | None) -> None:
+        async def split(mid: str, bound: Bound) -> None:
+            """Open ``(mid, hi]`` if a probe finds a key there. If not, the range
+            ends at ``mid`` and splits where its keys are dense instead: keys
+            that cluster leave most midpoints empty. The range keeps reading
+            meanwhile."""
+            nonlocal open_ranges
+            try:
+                key: str | None = await self._probe(prefix, mid)
+            except Exception:  # noqa: BLE001
+                key = mid  # split unprobed
+            finally:
+                bound.probing = False
+            hi = bound.hi
+            if bound.done or (bound.last or "") >= mid or not bound.keeps(mid):
+                open_ranges -= 1  # the range got there first
+            elif key is None or not bound.keeps(key):
+                bound.shrink(mid)  # nothing past mid: no empty range to read
+                dense = key_midpoint(bound.last or "", mid, alphabet, bound.first)
+                if bound.first is not None and dense is not None:
+                    queue.put_nowait((dense, mid, bound.pages))
+                    bound.shrink(dense)
+                else:
+                    open_ranges -= 1
+            else:
+                queue.put_nowait((mid, hi, bound.pages))
+                bound.shrink(mid)
+
+        async def read(lo: str, hi: str | None, age: int) -> None:
+            bound = Bound(hi)
+            bound.pages = age
+            try:
+                await read_pages_of(lo, bound)
+            finally:
+                bound.done = True
+
+        async def read_pages_of(lo: str, bound: Bound) -> None:
             nonlocal open_ranges, found, seeks
             can_split = bool(lo)  # a one-page listing stays one request
-            bound = Bound(hi)
-
             pages = self._range_pages(prefix, lo, bound, pool)
             async with aclosing(pages):
                 async for files, first, last in pages:
+                    bound.pages += 1
+                    if last is not None:  # before the put: a probe may return meanwhile
+                        bound.last = max(bound.last or last, last)
+                        bound.first = first
                     if first is not None and first < lo:  # the server ignores the start
                         seeks = False
                     if files:
@@ -448,25 +496,47 @@ class Client(ABC):
                     if not bound.keeps(last):
                         return
                     ordered = seeks and self._lists_in_key_order()
-                    if can_split and ordered and open_ranges < LIST_WORKERS:
-                        mid = key_midpoint(last, bound.hi, alphabet, first)
-                        if mid is not None:
-                            queue.put_nowait((mid, bound.hi))
-                            open_ranges += 1
-                            bound.shrink(mid)
+                    if can_split and ordered and not bound.probing:
+                        maybe_split(bound, last, first)
                     can_split = True
+
+        def maybe_split(bound: Bound, last: str, first: str | None):
+            """With an open end, an old range splits at most pages squared ahead:
+            a small listing stays near its keys and a large one soon reaches its
+            end."""
+            nonlocal open_ranges
+            if open_ranges >= in_flight:
+                return
+            young = bound.pages <= YOUNG_PAGES
+            if young:
+                mid = key_midpoint(last, bound.hi, alphabet, first)
+            elif bound.hi is None:
+                mid = key_midpoint(last, None, alphabet, first, bound.pages**2)
+            else:
+                mid = key_midpoint(last, bound.hi, alphabet)
+            if mid is None:
+                return
+            open_ranges += 1
+            unprobed = bound.hi is not None and not self.PROBE_BOUNDED_SPLITS
+            if young or unprobed:
+                queue.put_nowait((mid, bound.hi, bound.pages))
+                bound.shrink(mid)
+            else:
+                bound.probing = True
+                probes.add(task := asyncio.create_task(split(mid, bound)))
+                task.add_done_callback(probes.discard)
 
         async def worker() -> None:
             nonlocal open_ranges
             while True:
-                lo, hi = await queue.get()
+                lo, hi, age = await queue.get()
                 try:
-                    await read(lo, hi)
+                    await read(lo, hi, age)
                 finally:
                     open_ranges -= 1
                     queue.task_done()
 
-        workers = [asyncio.create_task(worker()) for _ in range(LIST_WORKERS)]
+        workers = [asyncio.create_task(worker()) for _ in range(in_flight)]
         done = asyncio.create_task(queue.join())
         try:
             await asyncio.wait([done, *workers], return_when=asyncio.FIRST_COMPLETED)
@@ -475,9 +545,10 @@ class Client(ABC):
             if not found and prefix:
                 raise FileNotFoundError(f"Unable to resolve remote path: {prefix}")
         finally:
-            for task in [done, *workers]:
+            tasks = [done, *workers, *probes]
+            for task in tasks:
                 task.cancel()
-            await asyncio.gather(done, *workers, return_exceptions=True)
+            await asyncio.gather(*tasks, return_exceptions=True)
             if pool:
                 pool.close()
             pbar.close()

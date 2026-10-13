@@ -28,6 +28,11 @@ class Bound:
     def __init__(self, hi: str | None) -> None:
         self.hi = hi
         self.on_shrink: Callable[[str], None] | None = None
+        self.last: str | None = None  # the last key read so far
+        self.first: str | None = None  # the first key of the last page
+        self.pages = 0  # read by this range and the ranges it split off from
+        self.probing = False  # a split waits for its probe
+        self.done = False
 
     def shrink(self, hi: str) -> None:
         self.hi = hi
