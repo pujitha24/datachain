@@ -225,3 +225,14 @@ def test_select_node_fields_by_parent_path_tar_wildcards_are_literal(
         "dir_%1/b.csv",
         "dir_%1/nested/c.csv",
     ]
+
+
+def test_empty_rows_insert_defaults(sqlite_db):
+    warehouse = SQLiteWarehouse(sqlite_db)
+    table = warehouse.create_udf_table([sa.Column("value", sa.Integer)])
+
+    warehouse.insert_rows(table, [{}, {}])
+    warehouse.insert_rows_done(table)
+
+    query = sa.select(table.c.value)
+    assert list(warehouse.dataset_rows_select(query)) == [(None,), (None,)]

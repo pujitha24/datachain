@@ -17,6 +17,7 @@ from azure.core.exceptions import (
 from azure.storage.blob import BlobServiceClient
 from fsspec.asyn import get_loop, sync
 
+from datachain.lib.convert.flatten import row_type
 from datachain.lib.file import File
 
 from .fsspec import BucketStatus, Client, Page
@@ -41,6 +42,9 @@ class _AzureWriteBuffer(SpooledTemporaryFile):
     """
 
     version_id: str | None = None
+
+
+FileRow = row_type(File)
 
 
 class AzureClient(Client):
@@ -287,7 +291,7 @@ class AzureClient(Client):
                     self._hns = True
                 names = [self._blob_name(b) for b in blobs]
                 files = [
-                    self._xml_to_file(b, n)
+                    self._xml_to_row(b, n)
                     for b, n in zip(blobs, names, strict=True)
                     if keep(n)
                 ]
@@ -300,16 +304,16 @@ class AzureClient(Client):
         text = name.text or ""
         return unquote(text) if name.get("Encoded") == "true" else text
 
-    def _xml_to_file(self, blob: Element, name: str) -> File:
+    def _xml_to_row(self, blob: Element, name: str) -> tuple:
         props = blob.find("Properties")
         assert props is not None
         version = blob.findtext("VersionId") if self._is_version_aware() else None
-        return File(
-            source=self.uri,
-            path=name,
-            etag=props.findtext("Etag", "").strip('"'),
-            version=version or "",
-            is_latest=version is None or blob.findtext("IsCurrentVersion") == "true",
-            last_modified=parsedate_to_datetime(props.findtext("Last-Modified", "")),
-            size=int(props.findtext("Content-Length", "0")),
+        return FileRow(
+            self.uri,
+            name,
+            int(props.findtext("Content-Length", "0")),
+            version or "",
+            props.findtext("Etag", "").strip('"'),
+            version is None or blob.findtext("IsCurrentVersion") == "true",
+            parsedate_to_datetime(props.findtext("Last-Modified", "")),
         )

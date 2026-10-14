@@ -12,6 +12,7 @@ from gcsfs import GCSFileSystem
 from gcsfs.retry import HttpError
 
 from datachain.client.fileslice import FileWrapper
+from datachain.lib.convert.flatten import row_type
 from datachain.lib.file import File
 
 from .fsspec import BucketStatus, Client, Page, iso_timestamp
@@ -23,6 +24,9 @@ if TYPE_CHECKING:
 GCSFileSystem.set_session = GCSFileSystem._set_session
 # Skip the GCE metadata check — it adds latency and hangs outside GCE.
 os.environ.setdefault("NO_GCE_CHECK", "true")
+
+
+FileRow = row_type(File)
 
 
 class GCSClient(Client):
@@ -245,14 +249,22 @@ class GCSClient(Client):
             )
             items = page.get("items", [])
             yield (
-                [self._entry_from_dict(d) for d in items if keep(d["name"])],
+                [self._row(d) for d in items if keep(d["name"])],
                 items[-1]["name"] if items else None,
             )
             if (token := page.get("nextPageToken")) is None:
                 return
 
-    def _entry_from_dict(self, d: dict[str, Any]) -> File:
-        return self.info_to_file(d, d["name"])
+    def _row(self, d: dict[str, Any]) -> tuple:
+        return FileRow(
+            self.uri,
+            d["name"],
+            int(d.get("size", 0)),
+            d.get("generation", "") if self._is_version_aware() else "",
+            d.get("etag", ""),
+            not d.get("timeDeleted"),
+            self.parse_timestamp(d["updated"]),
+        )
 
     def info_to_file(self, v: dict[str, Any], path: str) -> File:
         return File(

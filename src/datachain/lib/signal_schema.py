@@ -35,7 +35,11 @@ from sqlalchemy.sql.elements import BinaryExpression, Grouping, Label
 from datachain import json
 from datachain.func import literal
 from datachain.func.func import Func
-from datachain.lib.convert.flatten import is_optional_model, iter_flat_columns
+from datachain.lib.convert.flatten import (
+    SENTINEL,
+    is_optional_model,
+    iter_flat_columns,
+)
 from datachain.lib.convert.python_to_sql import python_to_sql
 from datachain.lib.convert.sql_to_python import sql_to_python
 from datachain.lib.convert.unflatten import (
@@ -1607,7 +1611,7 @@ class SignalSchema:
 
     # `_type_tag` = 0-based index of the active arm (Optional[X] == Union[X, None]:
     # present=0, None=1). Leading-underscore internal column, int | None.
-    _OPTIONAL_SENTINEL_FIELD = "_type_tag"
+    _OPTIONAL_SENTINEL_FIELD = SENTINEL
     _OPTIONAL_SENTINEL_TYPE = int | None  # type: ignore[valid-type]
 
     @staticmethod

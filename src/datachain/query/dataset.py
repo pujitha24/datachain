@@ -586,6 +586,41 @@ def process_udf_outputs(
     else:
         udf_kind = "map"
 
+    if udf_kind == "map":
+        columns = ["sys__id", *udf.output]
+    else:
+        columns = [*udf.output, "sys__input_id", "sys__partial", "sys__empty"]
+
+    # types of values adjust_outputs keeps as they are, per column of a row in
+    # `columns` order; it only puts the column default in place of None
+    exact = _keeps_exact_types(type(warehouse))
+    kept_types = [
+        frozenset({type(None)})
+        | (
+            {python_type}
+            if exact and python_type not in (list, dict) and type_name != "JSON"
+            else set()
+        )
+        for _, _, python_type, type_name, _ in udf_col_types
+    ] + [frozenset({int, bool, type(None)})] * 3
+    defaults = [
+        (i, default)
+        for i, (*_, default) in enumerate(udf_col_types)
+        if default is not None
+    ]
+
+    def kept_as_is(row: tuple) -> bool:
+        return all(map(frozenset.__contains__, kept_types, map(type, row)))
+
+    def with_defaults(row: tuple) -> tuple:
+        if not defaults or None not in row:
+            return row
+        values = list(row)
+        for i, default in defaults:
+            if values[i] is None:
+                values[i] = default
+        return tuple(values)
+
     def _insert_rows():
         for udf_output in udf_results:
             if not udf_output:
@@ -594,17 +629,24 @@ def process_udf_outputs(
             with safe_closing(udf_output):
                 for row in udf_output:
                     cb.relative_update()
-                    yield adjust_outputs(
+                    if type(row) is tuple:
+                        if kept_as_is(row):
+                            yield with_defaults(row)
+                            continue
+                        row = dict(zip(columns, row, strict=True))
+                    row = adjust_outputs(
                         warehouse,
                         row,
                         udf_col_types,
                         udf_signal_schema,
                         udf_kind=udf_kind,
                     )
+                    yield tuple(map(row.__getitem__, columns))
 
     try:
-        warehouse.insert_rows(
+        warehouse.insert_tuples(
             udf_table,
+            columns,
             _insert_rows(),
             batch_size=batch_size,
         )

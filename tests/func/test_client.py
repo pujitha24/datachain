@@ -72,6 +72,7 @@ def test_scandir_not_dir(client):
 def test_scandir_success(client):
     results = scandir(client, "")
     match_entries(results, ENTRIES)
+    assert {type(e) for e in results} == {File}
 
 
 def _paths(tree, prefix=""):

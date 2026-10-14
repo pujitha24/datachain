@@ -14,6 +14,7 @@ from botocore.utils import parse_timestamp
 from fsspec.asyn import get_loop, sync
 from s3fs import S3FileSystem
 
+from datachain.lib.convert.flatten import row_type
 from datachain.lib.file import File
 
 from .fsspec import DELIMITER, BucketStatus, Client, Page, ResultQueue, iso_timestamp
@@ -123,6 +124,9 @@ def _session(profile: str | None) -> AioSession:
     session.unregister("before-parse.s3.*", handlers._handle_200_error)
     session.register("before-parse.s3.*", _handle_200_error)
     return session
+
+
+FileRow = row_type(File)
 
 
 class ClientS3(Client):
@@ -295,25 +299,19 @@ class ClientS3(Client):
             entries = page.get(key, [])
             keys = [d["Key"] for d in entries + page.get("DeleteMarkers", [])]
             yield (
-                [
-                    self._entry_from_boto(d, self.name, versions)
-                    for d in entries
-                    if keep(d["Key"])
-                ],
+                [self._row_from_boto(d, versions) for d in entries if keep(d["Key"])],
                 max(keys, default=None),
             )
 
-    def _entry_from_boto(self, v, bucket, versions=False) -> File:
-        return File(
-            source=self.uri,
-            path=v["Key"],
-            etag=v.get("ETag", "").strip('"'),
-            version=(
-                ClientS3.clean_s3_version(v.get("VersionId", "")) if versions else ""
-            ),
-            is_latest=v.get("IsLatest", True),
-            last_modified=v.get("LastModified", ""),
-            size=v["Size"],
+    def _row_from_boto(self, v, versions: bool) -> tuple:
+        return FileRow(
+            self.uri,
+            v["Key"],
+            v["Size"],
+            ClientS3.clean_s3_version(v.get("VersionId", "")) if versions else "",
+            v.get("ETag", "").strip('"'),
+            v.get("IsLatest", True),
+            v["LastModified"],
         )
 
     async def _fetch_dir(

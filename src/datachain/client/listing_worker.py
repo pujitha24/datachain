@@ -7,6 +7,7 @@ import sys
 import threading
 from collections.abc import AsyncGenerator
 from contextlib import aclosing, suppress
+from functools import partial
 from typing import TYPE_CHECKING, Any, BinaryIO
 
 if TYPE_CHECKING:
@@ -18,7 +19,7 @@ logger = logging.getLogger("datachain")
 
 PROCESSES = min(4, (os.cpu_count() or 1) - 1)
 FRAME = struct.Struct("<Q")
-# files, first key, last key; files are ``File`` objects or flat ``File`` rows
+# files, first key, last key; files are ``row_type(File)`` rows
 RangePage = tuple[list[Any], str | None, str | None]
 
 
@@ -197,8 +198,12 @@ class Pool:
     async def pages(
         self, prefix: str, lo: str, bound: Bound
     ) -> AsyncGenerator[RangePage, None]:
+        from datachain.lib.convert.flatten import row_type
+        from datachain.lib.file import File
+
         if not self.children:
             raise ChildDied
+        file_row = partial(tuple.__new__, row_type(File))
         child = min(self.children, key=lambda c: len(c.ranges))
         rid = self.next_id = self.next_id + 1
         queue: asyncio.Queue = asyncio.Queue(2)
@@ -209,7 +214,8 @@ class Pool:
             while True:
                 kind, *rest = await child.get(queue)
                 if kind == "page":
-                    yield tuple(rest)  # type: ignore[misc]
+                    files, first, last = rest
+                    yield list(map(file_row, files)), first, last
                 elif kind == "end":
                     return
                 else:
@@ -229,8 +235,6 @@ class Pool:
 
 
 async def _serve(client: "Client", inp: BinaryIO, out: BinaryIO) -> None:
-    from datachain.lib.convert.flatten import flatten
-
     loop = asyncio.get_running_loop()
     inbox: asyncio.Queue = asyncio.Queue()
 
@@ -253,7 +257,8 @@ async def _serve(client: "Client", inp: BinaryIO, out: BinaryIO) -> None:
             pages = client._local_pages(prefix, lo, bound)
             async with aclosing(pages):
                 async for files, first, last in pages:
-                    write("page", rid, [flatten(f) for f in files], first, last)
+                    # plain tuples: a row type would unpickle per row in Python
+                    write("page", rid, [tuple(f) for f in files], first, last)
                     if last is not None and not bound.keeps(last):
                         break
             write("end", rid)

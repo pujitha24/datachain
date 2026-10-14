@@ -54,13 +54,21 @@ DATA_SOURCE_URI_PATTERN = re.compile(r"^[\w]+:\/\/.*$")
 FRACTION = re.compile(r"(?<=\.)\d+")
 CLOUD_STORAGE_PROTOCOLS = {"s3", "gs", "az", "hf"}
 
-ResultQueue = asyncio.Queue[Sequence[Any]]  # File objects or flat File rows
-Page = tuple[list["File"], str | None]  # files and the last key listed
+ResultQueue = asyncio.Queue[Sequence[Any]]  # File objects or row_type(File) rows
+Page = tuple[list[Any], str | None]  # File rows and the last key listed
 
 
 def is_cloud_uri(uri: str) -> bool:
     protocol = urlparse(uri).scheme
     return protocol in CLOUD_STORAGE_PROTOCOLS
+
+
+def _as_files(page: Sequence[Any]) -> Sequence[Any]:
+    if not page or not isinstance(page[0], tuple):
+        return page
+    from datachain.lib.file import File
+
+    return [File(**row._asdict()) for row in page]
 
 
 def iso_timestamp(value: str) -> datetime | None:
@@ -351,10 +359,15 @@ class Client(ABC):
         )
 
     async def scandir(
-        self, start_prefix: str, method: str = "default", processes: bool = False
+        self,
+        start_prefix: str,
+        method: str = "default",
+        processes: bool = False,
+        rows: bool = False,
     ) -> AsyncIterator[Sequence[Any]]:
-        """Pages of ``File`` objects; with ``processes``, a range listing may parse
-        pages in child processes, which send flat ``File`` rows instead."""
+        """Pages of ``File`` objects; with ``rows``, a range listing yields
+        ``row_type(File)`` rows instead. With ``processes``, a range listing may
+        parse pages in child processes."""
         try:
             impl = getattr(self, f"_fetch_{method}")
         except AttributeError:
@@ -371,11 +384,12 @@ class Client(ABC):
                     [get, main_task], return_when=asyncio.FIRST_COMPLETED
                 )
                 if get.done():
-                    yield get.result()
+                    yield get.result() if rows else _as_files(get.result())
                 else:
                     get.cancel()
             while not result_queue.empty():
-                yield result_queue.get_nowait()
+                page = result_queue.get_nowait()
+                yield page if rows else _as_files(page)
             await main_task
         finally:
             pending = [main_task] if get is None else [main_task, get]
@@ -420,7 +434,10 @@ class Client(ABC):
             progress_bar.close()
 
     async def _fetch_ranges(  # noqa: C901, PLR0915
-        self, start_prefix: str, result_queue: ResultQueue, processes: bool = False
+        self,
+        start_prefix: str,
+        result_queue: ResultQueue,
+        processes: bool = False,
     ) -> None:
         """List key ranges ``(lo, hi]`` in parallel; while a worker is idle, a
         busy range hands over its upper half, split at a key midpoint. A young

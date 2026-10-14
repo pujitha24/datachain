@@ -1,3 +1,4 @@
+import functools
 import hashlib
 import inspect
 import logging
@@ -22,6 +23,8 @@ from datachain.lib.convert.flatten import (
     flatten,
     flatten_value,
     is_optional_model,
+    row_model,
+    row_type,
 )
 from datachain.lib.file import File, FileError
 from datachain.lib.signal_schema import SignalSchema
@@ -222,6 +225,27 @@ class UDFAdapter:
         return self.inner.prefetch
 
 
+@functools.lru_cache(maxsize=1024)
+def _row_spec(anno: Any) -> tuple[Any, bool]:
+    kind = classify_field(anno)
+    return (row_type(kind.inner) if kind.is_model else None), kind.is_optional
+
+
+def _row_values(row: Any, anno: Any) -> tuple:
+    try:
+        expected, optional = _row_spec(anno)
+    except TypeError:  # unhashable annotation
+        expected, optional = _row_spec.__wrapped__(anno)
+    # any model with the same columns fits: a File row for an ImageFile output
+    if type(row) is not expected and (
+        expected is None or type(row)._fields != expected._fields
+    ):
+        raise TypeError(
+            f"UDF returned a {type(row).__name__} for an output declared as {anno}"
+        )
+    return (0, *row) if optional else row
+
+
 class UDFBase(AbstractUDF):
     """Base class for stateful user-defined functions.
 
@@ -411,8 +435,10 @@ class UDFBase(AbstractUDF):
             flat: list[Any] = []
             # strict=False as shorter row is allowed for arrow/parquet (guarded above)
             for obj, anno in zip(row, annos.values(), strict=False):
+                if row_model(obj) is not None:
+                    flat.extend(_row_values(obj, anno))
                 # tag is added only when obj IS the Optional value, not a wrapper.
-                if is_optional_model(anno) and (
+                elif is_optional_model(anno) and (
                     obj is None or isinstance(obj, classify_field(anno).inner)
                 ):
                     flat.extend(flatten_value(obj, anno))
@@ -420,11 +446,27 @@ class UDFBase(AbstractUDF):
                     flat.extend(self._obj_to_list(obj))
             return tuple(flat)
         if isinstance(row, tuple):
+            if len(self.output.values) == 1 and row_model(row) is not None:
+                return _row_values(row, next(iter(self.output.values.values())))
             return row
         if len(self.output.values) == 1:
             single_type = next(iter(self.output.values.values()))
             return flatten_value(row, single_type)
         return tuple(self._obj_to_list(row))
+
+    def _insert_row_type(self) -> type | None:
+        if len(self.output.values) != 1:
+            return None
+        anno = next(iter(self.output.values.values()))
+        try:
+            expected, optional = _row_spec(anno)
+        except Exception:  # noqa: BLE001  # rows are an optimization, models still work
+            return None
+        if expected is None or optional:
+            return None
+        name = next(iter(self.output.values))
+        columns = [f"{name}__{field}" for field in expected._fields]
+        return expected if columns == list(self.signal_names) else None
 
     @staticmethod
     def _obj_to_list(obj):
@@ -768,6 +810,16 @@ class Generator(UDFBase):
     ) -> Iterator[Iterable[UDFResult]]:
         self.setup()
         signal_names = list(self.signal_names)
+        row_cls = self._insert_row_type()
+        same_columns: dict[type, bool] = {}
+
+        def fits(t: type) -> bool:
+            # rows of another model with the same columns: File rows for ImageFile
+            if t not in same_columns:
+                same_columns[t] = getattr(t, "__dc_model__", None) is not None and (
+                    t._fields == row_cls._fields  # type: ignore[attr-defined, union-attr]
+                )
+            return same_columns[t]
 
         def _prepare_rows(udf_inputs) -> "abc.Generator[Sequence[Any], None, None]":
             with safe_closing(udf_inputs):
@@ -785,6 +837,10 @@ class Generator(UDFBase):
             with safe_closing(result) as result_objs:
                 for result_obj, is_last in with_last_flag(result_objs):
                     has_output = True
+                    t = type(result_obj)
+                    if t is row_cls or (row_cls is not None and fits(t)):
+                        yield result_obj + (row_id, not is_last, None)  # noqa: RUF005
+                        continue
                     udf_output = self._flatten_row(result_obj)
                     udf_output = dict(zip(signal_names, udf_output, strict=False))
                     udf_output["sys__input_id"] = row_id
