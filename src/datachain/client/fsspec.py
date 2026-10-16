@@ -16,7 +16,7 @@ from collections.abc import (
     Iterator,
     Sequence,
 )
-from contextlib import aclosing, contextmanager, suppress
+from contextlib import aclosing, contextmanager, nullcontext, suppress
 from datetime import datetime
 from typing import TYPE_CHECKING, Any, BinaryIO, ClassVar, Literal, NamedTuple
 from urllib.parse import urlparse
@@ -477,6 +477,7 @@ class Client(ABC):
         open_ranges, found, seeks = 1, False, True
         pool = Pool(self, prefix, PROCESSES) if processes else None
         in_flight = PROCESS_LIST_WORKERS if pool and pool.size else LIST_WORKERS
+        local = asyncio.Semaphore(LIST_WORKERS)  # requests from this process
         probes: set[asyncio.Task] = set()
         pbar = tqdm(desc=f"Listing {self.uri}", unit=" objects", leave=False)
 
@@ -487,7 +488,8 @@ class Client(ABC):
             meanwhile."""
             nonlocal open_ranges
             try:
-                key: str | None = await self._probe(prefix, mid)
+                async with local:
+                    key: str | None = await self._probe(prefix, mid)
             except Exception:  # noqa: BLE001
                 key = mid  # split unprobed
             finally:
@@ -524,7 +526,7 @@ class Client(ABC):
         async def read_pages_of(lo: str, bound: Bound) -> None:
             nonlocal open_ranges, found, seeks
             can_split = bool(lo)  # a one-page listing stays one request
-            pages = self._range_pages(prefix, lo, bound, pool)
+            pages = self._range_pages(prefix, lo, bound, pool, local)
             async with aclosing(pages):
                 async for files, first, last in pages:
                     bound.pages += 1
@@ -610,7 +612,12 @@ class Client(ABC):
         return True
 
     async def _range_pages(
-        self, prefix: str, lo: str, bound: "Bound", pool: "Pool | None"
+        self,
+        prefix: str,
+        lo: str,
+        bound: "Bound",
+        pool: "Pool | None",
+        local: asyncio.Semaphore | None = None,
     ) -> AsyncGenerator["RangePage", None]:
         """Pages of ``(lo, bound.hi]`` as ``(files, first key, last key)``, listed
         here or by a child process once one is running. The files of a page's last
@@ -622,9 +629,13 @@ class Client(ABC):
         while True:
             remote = pool is not None and pool.ready()
             held: list[Any] = []
-            source = pool.pages if pool and remote else self._local_pages
+            source = (
+                pool.pages(prefix, done, bound)
+                if pool and remote
+                else self._local_pages(prefix, done, bound, local)
+            )
             try:
-                async with aclosing(source(prefix, done, bound)) as pages:
+                async with aclosing(source) as pages:
                     async for files, first, last in pages:
                         files, held = held + files, []
                         read_pages += 1
@@ -659,14 +670,23 @@ class Client(ABC):
                 pass
 
     async def _local_pages(
-        self, prefix: str, lo: str, bound: "Bound"
+        self,
+        prefix: str,
+        lo: str,
+        bound: "Bound",
+        limit: asyncio.Semaphore | None = None,
     ) -> AsyncGenerator["RangePage", None]:
         def keep(key: str) -> bool:
             return self._is_valid_key(key) and bound.keeps(key)
 
         lo_key = self.key_order(lo)
         async with aclosing(self._pages_after(prefix, lo, keep, hi=bound.hi)) as pages:
-            async for files, first, last in pages:
+            while True:
+                async with limit or nullcontext():
+                    page = await anext(pages, None)
+                if page is None:
+                    return
+                files, first, last = page
                 # GCS startOffset and Azure start_from include the start key
                 yield [f for f in files if self.key_order(f.path) > lo_key], first, last
 

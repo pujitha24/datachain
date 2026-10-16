@@ -1,7 +1,9 @@
 import asyncio
+import copy
 import logging
 import os
 import pickle
+import signal
 import struct
 import sys
 import threading
@@ -17,7 +19,55 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger("datachain")
 
-PROCESSES = min(4, (os.cpu_count() or 1) - 1)
+
+def _cpu_quotas(
+    root: str = "/sys/fs/cgroup", membership: str = "/proc/self/cgroup"
+) -> list[tuple[int, int]]:
+    """``(quota, period)`` of each cgroup this process is in, and their parents."""
+    quotas = []
+    with suppress(OSError):
+        with open(membership) as f:
+            lines = f.read().splitlines()
+        for line in lines:
+            _, controllers, path = line.split(":", 2)
+            if not controllers:  # v2
+                base, files = root, ["cpu.max"]
+            elif "cpu" in controllers.split(","):  # v1
+                base = os.path.join(root, controllers)
+                files = ["cpu.cfs_quota_us", "cpu.cfs_period_us"]
+            else:
+                continue
+            parts = [p for p in path.split("/") if p]
+            for depth in range(len(parts) + 1):
+                folder = os.path.join(base, *parts[:depth])
+                with suppress(OSError, ValueError):
+                    quota, period = " ".join(
+                        _read_text(os.path.join(folder, name)) for name in files
+                    ).split()
+                    if quota not in ("max", "-1"):
+                        quotas.append((int(quota), int(period)))
+    return quotas
+
+
+def _read_text(path: str) -> str:
+    with open(path) as f:
+        return f.read()
+
+
+def usable_cpus() -> int:
+    """The CPUs this process may run on, within its cgroups' CPU quotas."""
+    if hasattr(os, "process_cpu_count"):
+        cpus = os.process_cpu_count() or 1
+    elif hasattr(os, "sched_getaffinity"):
+        cpus = len(os.sched_getaffinity(0))
+    else:
+        cpus = os.cpu_count() or 1
+    for quota, period in _cpu_quotas():
+        cpus = min(cpus, quota // period)
+    return max(cpus, 1)
+
+
+PROCESSES = 0 if usable_cpus() < 2 else min(4, usable_cpus())
 FRAME = struct.Struct("<Q")
 # files, first key, last key; files are ``row_type(File)`` rows
 RangePage = tuple[list[Any], str | None, str | None]
@@ -63,17 +113,31 @@ def item_path(item: Any) -> str:
     return item[1] if isinstance(item, tuple) else item.path  # path is column 1
 
 
+def _pickles(value: Any) -> bool:
+    try:
+        pickle.dumps(value)
+    except Exception:  # noqa: BLE001
+        return False
+    return True
+
+
 def picklable(e: Exception) -> Exception:
-    """``e``, or an exception of its type and message when ``e`` holds what does
-    not pickle, such as a traceback."""
-    with suppress(Exception):
-        pickle.dumps(e)
+    """``e``, or a copy of it that pickles: of its nearest class that pickles,
+    with each attribute that does not pickle set to ``None``."""
+    if _pickles(e):
         return e
     with suppress(Exception):
-        err = type(e)(str(e))
-        pickle.dumps(err)
-        return err
-    return RuntimeError(f"{type(e).__name__}: {e}")
+        err = copy.copy(e)
+        if (cls := next(c for c in type(e).__mro__ if _pickles(c))) is not type(e):
+            err.__class__ = cls
+        for name, value in vars(err).items():
+            if not _pickles(value):
+                setattr(err, name, None)
+        if _pickles(err):
+            return err
+    with suppress(Exception):
+        return RuntimeError(f"{type(e).__name__}: {e}")
+    return RuntimeError(type(e).__name__)
 
 
 def dump(frame: tuple) -> bytes:
@@ -96,20 +160,19 @@ class Child:
         self.died = asyncio.Event()
 
     async def start(self, spec: bytes) -> None:
-        # the child must import this datachain, whatever the cwd or PYTHONPATH
-        root = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
-        path = os.pathsep.join(filter(None, [root, os.environ.get("PYTHONPATH")]))
+        # the parent's imports, whatever the cwd holds
+        code = f"import sys; sys.path[:] = {sys.path!r}; from {__name__} import main"
         self.proc = await asyncio.create_subprocess_exec(
             sys.executable,
-            "-m",
-            __name__,
+            "-c",
+            f"{code}; main()",
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
-            env={**os.environ, "PYTHONPATH": path},
         )
         self.send_raw(spec)
-        if await self.read() != ("ready", None):
-            raise ChildDied
+        kind, error = await self.read()
+        if kind != "ready" or error is not None:
+            raise ChildDied from error
 
     def send_raw(self, data: bytes) -> None:
         assert self.proc and self.proc.stdin
@@ -171,13 +234,16 @@ class Pool:
                     prefix,
                 )
             )
-        except Exception:  # noqa: BLE001
-            logger.debug("Listing in one process: client config does not pickle")
+        except Exception:
+            logger.debug(
+                "Listing in one process: client config does not pickle", exc_info=True
+            )
             size = 0
         self.size = size
         self.children: list[Child] = []
         self.tasks: list[asyncio.Task] = []
         self.next_id = 0
+        self.closed = self.warned = False
 
     def start(self) -> None:
         if not self.tasks:
@@ -189,12 +255,27 @@ class Pool:
             await child.start(self.spec)
             self.children.append(child)
             await child.serve()
-        except Exception:
+        except (
+            OSError,
+            EOFError,
+            ChildDied,
+            NotImplementedError,
+            pickle.UnpicklingError,
+        ):
             logger.debug("Listing process failed", exc_info=True)
+        except Exception:
+            logger.warning("Listing process failed", exc_info=True)
         finally:  # also when cancelled while the child starts
             if child in self.children:
                 self.children.remove(child)
             child.kill()
+            self._warn_when_alone()
+
+    def _warn_when_alone(self) -> None:
+        running = [t for t in self.tasks if not t.done()]  # this one is still running
+        if not (self.closed or self.warned or self.children or len(running) > 1):
+            self.warned = True
+            logger.warning("Listing in one process: no listing process runs")
 
     def ready(self) -> bool:
         return bool(self.children)
@@ -240,13 +321,16 @@ class Pool:
                 queue.get_nowait()
 
     def close(self) -> None:
+        self.closed = True
         for task in self.tasks:
             task.cancel()
         for child in self.children:
             child.kill()
 
 
-async def _serve(client: "Client", prefix: str, inp: BinaryIO, out: BinaryIO) -> None:
+async def _serve(  # noqa: C901
+    client: "Client", prefix: str, inp: BinaryIO, out: BinaryIO
+) -> None:
     loop = asyncio.get_running_loop()
     inbox: asyncio.Queue = asyncio.Queue()
 
@@ -256,8 +340,11 @@ async def _serve(client: "Client", prefix: str, inp: BinaryIO, out: BinaryIO) ->
         loop.call_soon_threadsafe(inbox.put_nowait, None)
 
     def write(*frame: Any) -> None:
-        out.write(dump(frame))
-        out.flush()
+        try:
+            out.write(dump(frame))
+            out.flush()
+        except BrokenPipeError:  # the parent is gone
+            os._exit(0)
 
     tasks: dict[int, asyncio.Task] = {}
     bounds: dict[int, Bound] = {}
@@ -285,8 +372,9 @@ async def _serve(client: "Client", prefix: str, inp: BinaryIO, out: BinaryIO) ->
     threading.Thread(target=pump, daemon=True).start()
     try:  # warm up DNS, TLS, credentials and the bucket region before taking work
         await client._probe(prefix, "")
-    except Exception:
-        logger.debug("Listing process warm-up failed", exc_info=True)
+    except Exception as e:  # noqa: BLE001
+        write("ready", picklable(e))
+        return
     write("ready", None)
     while (msg := await inbox.get()) is not None:
         kind, rid, *args = msg
@@ -305,12 +393,18 @@ async def _serve(client: "Client", prefix: str, inp: BinaryIO, out: BinaryIO) ->
 def main() -> None:
     from fsspec.asyn import get_loop, sync
 
+    signal.signal(signal.SIGINT, signal.SIG_IGN)  # the parent closes stdin
     out = os.fdopen(os.dup(1), "wb")
+    inp = os.fdopen(os.dup(0), "rb")
     os.dup2(2, 1)  # stray prints must not corrupt the frames
-    cls, name, fs_kwargs, cache, page_size, prefix = load(sys.stdin.buffer)
+    with open(os.devnull, "rb") as devnull:  # nor a credential process read them
+        os.dup2(devnull.fileno(), 0)
+    if (spec := load(inp)) is None:
+        return
+    cls, name, fs_kwargs, cache, page_size, prefix = spec
     client = cls(name, fs_kwargs, cache)
     client.LIST_PAGE_SIZE = page_size
-    sync(get_loop(), _serve, client, prefix, sys.stdin.buffer, out)
+    sync(get_loop(), _serve, client, prefix, inp, out)
 
 
 if __name__ == "__main__":

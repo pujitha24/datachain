@@ -43,8 +43,8 @@ def children(client, mocker):
         started.append(self)
         pool_start(self)
 
-    async def gated(self, prefix, lo, bound):
-        async for page in local_pages(self, prefix, lo, bound):
+    async def gated(self, prefix, lo, bound, limit=None):
+        async for page in local_pages(self, prefix, lo, bound, limit):
             deadline = time.monotonic() + 30
             while starting(started) and time.monotonic() < deadline:  # noqa: ASYNC110
                 await asyncio.sleep(0.01)
@@ -232,3 +232,101 @@ def test_file_types_from_children(
     assert remote_rows
     assert {type(f) for f in files} == {file_type}
     assert sorted(flatten(f) for f in files) == listing(client, processes=False)
+
+
+@pytest.fixture
+def requests_in_flight(client, mocker):
+    """The most page requests the parent had open at once."""
+    peak = [0]
+    now = 0
+    pages_after = type(client)._pages_after
+
+    async def counted(self, *args, **kwargs):
+        nonlocal now
+        pages = pages_after(self, *args, **kwargs)
+        async with aclosing(pages):
+            while True:
+                now += 1
+                peak[0] = max(peak[0], now)
+                try:
+                    page = await anext(pages)
+                except StopAsyncIteration:
+                    return
+                finally:
+                    now -= 1
+                yield page
+
+    mocker.patch.object(type(client), "_pages_after", counted)
+    return peak
+
+
+@pytest.mark.parametrize("cloud_type", ["s3", "gs", "azure"], indirect=True)
+@pytest.mark.parametrize("tree", [{f"{i:03}": "x" for i in range(400)}], indirect=True)
+def test_parent_lists_with_its_own_budget_when_no_child_runs(
+    client, tree, requests_in_flight, mocker, caplog
+):
+    mocker.patch("datachain.client.fsspec.LIST_WORKERS", 3)
+    mocker.patch.object(Child, "start", side_effect=OSError("no process"))
+
+    with caplog.at_level("WARNING", logger="datachain"):
+        assert len(listing(client)) == len(tree)
+
+    assert requests_in_flight[0] <= 3
+    warnings = [
+        r for r in caplog.records if r.name == "datachain" and r.levelname == "WARNING"
+    ]
+    assert [r.getMessage() for r in warnings] == [
+        "Listing in one process: no listing process runs"
+    ]
+
+
+@pytest.mark.parametrize("cloud_type", ["s3"], indirect=True)
+@pytest.mark.parametrize("tree", [TREE], indirect=True)
+def test_children_import_datachain_whatever_the_cwd_holds(
+    client, tree, children, remote_rows, tmp_path, monkeypatch
+):
+    (tmp_path / "fsspec.py").write_text("raise ImportError('shadowed')\n")
+    monkeypatch.chdir(tmp_path)
+
+    assert listing(client) == listing(client, processes=False)
+    assert remote_rows
+
+
+CREDENTIAL_PROCESS = """
+import json, os, stat, sys
+with open(sys.argv[1], "a") as log:
+    log.write(f"{os.getppid()} {stat.S_ISFIFO(os.fstat(0).st_mode)}\\n")
+print(json.dumps({"Version": 1, "AccessKeyId": sys.argv[2],
+                  "SecretAccessKey": sys.argv[3], "SessionToken": sys.argv[4]}))
+"""
+
+
+@pytest.mark.parametrize("cloud_type", ["s3"], indirect=True)
+@pytest.mark.parametrize("tree", [TREE], indirect=True)
+def test_children_take_credentials_from_a_credential_process(
+    client, tree, children, remote_rows, tmp_path, monkeypatch
+):
+    import os
+    import sys
+
+    script, log = tmp_path / "creds.py", tmp_path / "creds.log"
+    script.write_text(CREDENTIAL_PROCESS)
+    kwargs = dict(client.fs_kwargs)
+    keys = [kwargs.pop(k) for k in ("aws_key", "aws_secret", "aws_token")]
+    config = tmp_path / "config"
+    config.write_text(
+        "[profile listing]\n"
+        f"credential_process = {sys.executable} {script} {log} {' '.join(keys)}\n"
+    )
+    monkeypatch.setenv("AWS_CONFIG_FILE", str(config))
+    for name in ["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN"]:
+        monkeypatch.delenv(name, raising=False)
+    client.fs_kwargs = {**kwargs, "profile": "listing"}
+    client._fs = None
+
+    assert len(listing(client)) == len(listing(client, processes=False))
+    assert remote_rows
+    calls = [line.split() for line in log.read_text().splitlines()]
+    in_children = [fifo for ppid, fifo in calls if int(ppid) != os.getpid()]
+    assert in_children
+    assert set(in_children) == {"False"}  # the frame pipe is not their stdin

@@ -170,9 +170,9 @@ def test_s3_probes_only_past_an_open_end(client, tree, mocker):
     opened = []
     range_pages = type(client)._range_pages
 
-    def spy(self, prefix, lo, bound, pool):
+    def spy(self, prefix, lo, bound, pool, local=None):
         opened.append((lo, bound.hi))
-        return range_pages(self, prefix, lo, bound, pool)
+        return range_pages(self, prefix, lo, bound, pool, local)
 
     mocker.patch.object(type(client), "_range_pages", spy)
 
