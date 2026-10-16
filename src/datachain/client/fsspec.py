@@ -9,14 +9,13 @@ import re
 import shutil
 from abc import ABC, abstractmethod
 from collections.abc import (
-    AsyncGenerator,
     AsyncIterator,
     Callable,
     Iterable,
     Iterator,
     Sequence,
 )
-from contextlib import aclosing, contextmanager, nullcontext, suppress
+from contextlib import aclosing, contextmanager, suppress
 from datetime import datetime
 from typing import TYPE_CHECKING, Any, BinaryIO, ClassVar, Literal, NamedTuple
 from urllib.parse import urlparse
@@ -35,7 +34,6 @@ from datachain.progress import tqdm
 if TYPE_CHECKING:
     from fsspec.spec import AbstractFileSystem
 
-    from datachain.client.listing_worker import Bound, Pool, RangePage
     from datachain.client.writeconfig import WriteConfig
     from datachain.dataset import StorageURI
     from datachain.lib.file import File
@@ -56,8 +54,51 @@ CLOUD_STORAGE_PROTOCOLS = {"s3", "gs", "az", "hf"}
 
 # pages of File objects or FileRow rows; None ends the listing
 ResultQueue = asyncio.Queue[Sequence[Any] | None]
-# File rows, and the first object and the last key of any kind listed
-Page = tuple[list[Any], str | None, str | None]
+
+
+class Page(NamedTuple):
+    """One listing request's reply."""
+
+    rows: list[Any]  # FileRow rows of the keys kept
+    first: str | None  # the first object's key
+    last: str | None  # the last key of any kind, delete markers included
+    token: Any  # resumes after this page; None on the last page
+
+
+class Bound:
+    """The read state of a range ``(lo, hi]``. Keys compare in ``order``, the
+    server's order. The fuzz tests check these rules:
+
+    - the ranges cover the listing without overlap;
+    - ``hi`` only shrinks;
+    - a finished range never splits;
+    - a range records how far it read before it waits on the result queue;
+    - a token advances only after its page is accepted.
+    """
+
+    def __init__(self, hi: str | None, order: Callable[[str], Any]) -> None:
+        self.order = order
+        self.hi = hi
+        self.last: str | None = None  # the last key read so far
+        self.first: str | None = None  # the first key of the last page
+        self.pages = 0  # read by this range and the ranges it split off from
+        self.probing = False  # a split waits for its probe
+        self.done = False
+
+    @property
+    def hi(self) -> str | None:
+        return self._hi
+
+    @hi.setter
+    def hi(self, hi: str | None) -> None:
+        self._hi = hi
+        self._hi_key = None if hi is None else self.order(hi)
+
+    def shrink(self, hi: str) -> None:
+        self.hi = hi
+
+    def keeps(self, key: str) -> bool:
+        return self._hi_key is None or self.order(key) <= self._hi_key
 
 
 def is_cloud_uri(uri: str) -> bool:
@@ -466,7 +507,7 @@ class Client(ABC):
         busy range hands over its upper half, split at a key midpoint. A young
         range splits close ahead, so a small listing stays a few requests. With
         ``processes``, a listing longer than a page moves to child processes."""
-        from .listing_worker import PROCESSES, Bound, Pool
+        from .listing_worker import PROCESSES, ChildDied, Pool
 
         prefix = start_prefix.lstrip(DELIMITER) + DELIMITER if start_prefix else ""
         # (lo, hi, pages read by the ranges this one split off from)
@@ -522,31 +563,62 @@ class Client(ABC):
             finally:
                 bound.done = True
 
+        async def fetch(lo: str, token: Any, bound: Bound) -> Page:
+            while pool and pool.ready():
+                with suppress(ChildDied):
+                    return await pool.list_page(prefix, lo, token, bound.hi)
+            async with local:
+                return await self._list_page(
+                    prefix, lo, token, self._keeps(bound.hi), hi=bound.hi
+                )
+
         async def read_pages_of(lo: str, bound: Bound) -> None:
             nonlocal open_ranges, found, seeks
             can_split = bool(lo)  # a one-page listing stays one request
-            pages = self._range_pages(prefix, lo, bound, pool, local)
-            async with aclosing(pages):
-                async for files, first, last in pages:
+            lo_key = order(lo)
+            page = await fetch(lo, None, bound)
+            next_page: asyncio.Task | None = None
+            try:
+                while True:
                     bound.pages += 1
+                    last, token = page.last, page.token
+                    # splits follow the keys kept; any object makes the prefix found
+                    first = page.rows[0].path if page.rows else None
                     if last is not None:  # before the put: a probe may return meanwhile
                         bound.last = max(bound.last or last, last, key=order)
                         bound.first = first
-                    if first is not None and order(first) < order(lo):
+                    if first is not None and order(first) < lo_key:
                         seeks = False  # the server ignores the start
+                    found = found or page.first is not None
+                    # GCS startOffset and Azure start_from include the start key
+                    files = [
+                        f
+                        for f in page.rows
+                        if bound.keeps(f.path) and order(f.path) > lo_key
+                    ]
+                    if last is not None and not bound.keeps(last):
+                        token = None
+                    elif last is not None and order(last) > lo_key:
+                        alphabet.update(last)
+                        ordered = seeks and self._lists_in_key_order()
+                        if token is not None and ordered:
+                            if pool and (lo or bound.pages > 1):
+                                pool.start()  # more than a page: worth a process
+                            if can_split and not bound.probing:
+                                maybe_split(bound, last, first)
+                        can_split = True
+                    if token is not None:
+                        next_page = asyncio.create_task(fetch(lo, token, bound))
                     if files:
                         await result_queue.put(files)
                         pbar.update(len(files))
-                    found = found or first is not None
-                    if last is None or order(last) <= order(lo):
-                        continue
-                    alphabet.update(last)
-                    if not bound.keeps(last):
+                    if next_page is None:
                         return
-                    ordered = seeks and self._lists_in_key_order()
-                    if can_split and ordered and not bound.probing:
-                        maybe_split(bound, last, first)
-                    can_split = True
+                    page, next_page = await next_page, None
+            finally:
+                if next_page is not None:
+                    next_page.cancel()
+                    await asyncio.gather(next_page, return_exceptions=True)
 
         def maybe_split(bound: Bound, last: str, first: str | None):
             """With an open end, an old range splits at most pages squared ahead:
@@ -610,107 +682,52 @@ class Client(ABC):
     def _lists_in_key_order(self) -> bool:
         return True
 
-    async def _range_pages(
+    def _keeps(self, hi: str | None) -> Callable[[str], bool]:
+        if hi is None:
+            return self._is_valid_key
+        hi_key = self.key_order(hi)
+        order = self.key_order
+        return lambda key: self._is_valid_key(key) and order(key) <= hi_key
+
+    async def _list_page(
         self,
         prefix: str,
-        lo: str,
-        bound: "Bound",
-        pool: "Pool | None",
-        local: asyncio.Semaphore | None = None,
-    ) -> AsyncGenerator["RangePage", None]:
-        """Pages of ``(lo, bound.hi]`` as ``(files, first key, last key)``, listed
-        here or by a child process once one is running. The files of a page's last
-        key wait for the next page, so a range that moves to a child, or off a
-        child that died, resumes after the last complete key."""
-        from .listing_worker import ChildDied, item_path
+        start_after: str,
+        token: Any,
+        keep: Callable[[str], bool],
+        page_size: int | None = None,
+        hi: str | None = None,
+    ) -> Page:
+        """One page under ``prefix``, in key order: the one after ``token``, or
+        the first after ``start_after``. Only keys to ``keep`` become rows. A
+        backend that can end a listing at a key ends it after ``hi``."""
+        raise NotImplementedError
 
-        done, read_pages = lo, 0  # every key up to ``done`` is complete
-        while True:
-            remote = pool is not None and pool.ready()
-            held: list[Any] = []
-            source = (
-                pool.pages(prefix, done, bound)
-                if pool and remote
-                else self._local_pages(prefix, done, bound, local)
-            )
-            try:
-                async with aclosing(source) as pages:
-                    async for files, first, last in pages:
-                        files, held = held + files, []
-                        read_pages += 1
-                        if last is not None and not bound.keeps(last):
-                            yield (
-                                [f for f in files if bound.keeps(item_path(f))],
-                                first,
-                                last,
-                            )
-                            return
-                        if pool and (remote or pool.usable()) and files:
-                            key, cut = item_path(files[-1]), len(files)
-                            while cut and item_path(files[cut - 1]) == key:
-                                cut -= 1
-                            files, held = files[:cut], files[cut:]
-                        if files:
-                            done = item_path(files[-1])
-                        if (
-                            pool
-                            and self._lists_in_key_order()
-                            and (lo or read_pages > 1)
-                        ):
-                            pool.start()  # more than a page: worth a process
-                        yield files, first, last
-                        if pool and not remote and pool.ready():
-                            break
-                    else:
-                        if held:
-                            yield held, None, None
-                        return
-            except ChildDied:
-                pass
-
-    async def _local_pages(
-        self,
-        prefix: str,
-        lo: str,
-        bound: "Bound",
-        limit: asyncio.Semaphore | None = None,
-    ) -> AsyncGenerator["RangePage", None]:
-        def keep(key: str) -> bool:
-            return self._is_valid_key(key) and bound.keeps(key)
-
-        lo_key = self.key_order(lo)
-        async with aclosing(self._pages_after(prefix, lo, keep, hi=bound.hi)) as pages:
-            while True:
-                async with limit or nullcontext():
-                    page = await anext(pages, None)
-                if page is None:
-                    return
-                files, first, last = page
-                # GCS startOffset and Azure start_from include the start key
-                yield [f for f in files if self.key_order(f.path) > lo_key], first, last
-
-    def _pages_after(
+    async def _pages_after(
         self,
         prefix: str,
         start_after: str,
         keep: Callable[[str], bool],
         page_size: int | None = None,
         hi: str | None = None,
-    ) -> AsyncGenerator[Page, None]:
-        """Pages under ``prefix`` after ``start_after``, in key order; only keys to
-        ``keep`` become files. A delete marker is not an object, but it can be a
-        page's last key. A backend that can end a listing at a key ends it after
-        ``hi``."""
-        raise NotImplementedError
+    ) -> AsyncIterator[Page]:
+        token = None
+        while True:
+            page = await self._list_page(
+                prefix, start_after, token, keep, page_size=page_size, hi=hi
+            )
+            yield page
+            if (token := page.token) is None:
+                return
 
     async def _probe(self, prefix: str, start_after: str) -> str | None:
         """The first key after ``start_after``, of any kind, even a delete marker;
         ``None`` only when the listing ends there."""
         pages = self._pages_after(prefix, start_after, lambda _: False, page_size=1)
-        async with aclosing(pages):
-            async for _, _, last in pages:
-                if last is not None:  # a page may be empty and still not the last
-                    return last
+        async with aclosing(pages):  # type: ignore[type-var]
+            async for page in pages:
+                if page.last is not None:  # a page may be empty and still not the last
+                    return page.last
         return None
 
     async def _fetch_default(

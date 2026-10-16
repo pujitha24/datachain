@@ -15,7 +15,6 @@ from tqdm import tqdm
 
 from datachain.asyn import get_loop
 from datachain.client import Client
-from datachain.client.listing_worker import item_path
 from datachain.lib.file import File, FileError
 from tests.data import ENTRIES
 
@@ -98,7 +97,7 @@ RANGE_TREES = {
 def test_scandir_ranges_are_exact(client, tree, prefix, mocker):
     mocker.patch.object(type(client), "LIST_PAGE_SIZE", 4)
     mocker.patch("datachain.client.fsspec.LIST_WORKERS", 3)
-    ranges = mocker.spy(client, "_pages_after")
+    ranges = mocker.spy(client, "_list_page")
     expected = [p for p in _paths(tree) if p.startswith(prefix)]
     if not expected:
         with pytest.raises(FileNotFoundError):
@@ -123,11 +122,14 @@ def test_scandir_old_ranges_split_far_after_a_probe(
     mocker.patch.object(type(client), "LIST_PAGE_SIZE", 4)
     mocker.patch("datachain.client.fsspec.LIST_WORKERS", workers)
     mocker.patch("datachain.client.fsspec.YOUNG_PAGES", young_pages)
-    calls = mocker.spy(client, "_pages_after")
+    calls = mocker.spy(client, "_list_page")
 
     assert sorted(e.path for e in scandir(client, "")) == sorted(tree)
     probes = [c for c in calls.call_args_list if c.kwargs.get("page_size")]
-    assert bool(probes) == (young_pages == 4)
+    if young_pages != 4:
+        assert not probes
+    elif workers == 2:  # many idle workers may split the open end past the data
+        assert probes
 
 
 @pytest.mark.parametrize("cloud_type", ["s3", "gs", "azure"], indirect=True)
@@ -135,11 +137,15 @@ def test_scandir_old_ranges_split_far_after_a_probe(
 def test_scandir_split_past_the_data_opens_no_range(client, tree, mocker):
     mocker.patch.object(type(client), "LIST_PAGE_SIZE", 4)
     mocker.patch("datachain.client.fsspec.LIST_WORKERS", 2)
-    calls = mocker.spy(client, "_pages_after")
+    calls = mocker.spy(client, "_list_page")
 
     assert sorted(e.path for e in scandir(client, "")) == sorted(tree)
     probes = [c.args[1] for c in calls.call_args_list if c.kwargs.get("page_size")]
-    ranges = [c.args[1] for c in calls.call_args_list if not c.kwargs.get("page_size")]
+    ranges = [
+        c.args[1]
+        for c in calls.call_args_list
+        if not c.kwargs.get("page_size") and c.args[2] is None
+    ]
     assert probes
     assert sum(lo > "199" for lo in ranges + probes) <= 4
 
@@ -155,7 +161,7 @@ def test_scandir_is_exact_when_the_reader_is_slow(client, tree, processes, mocke
     async def slow_reader():
         paths = []
         async for entries in client.scandir("", processes=processes):
-            paths.extend(item_path(e) for e in entries)
+            paths.extend(e.path for e in entries)
             await asyncio.sleep(0.02)
         return paths
 
@@ -167,16 +173,14 @@ def test_scandir_is_exact_when_the_reader_is_slow(client, tree, processes, mocke
 def test_s3_probes_only_past_an_open_end(client, tree, mocker):
     mocker.patch.object(type(client), "LIST_PAGE_SIZE", 4)
     probes = mocker.spy(client, "_probe")
-    opened = []
-    range_pages = type(client)._range_pages
-
-    def spy(self, prefix, lo, bound, pool, local=None):
-        opened.append((lo, bound.hi))
-        return range_pages(self, prefix, lo, bound, pool, local)
-
-    mocker.patch.object(type(client), "_range_pages", spy)
+    calls = mocker.spy(client, "_list_page")
 
     assert sorted(e.path for e in scandir(client, "")) == sorted(tree)
+    opened = [
+        (c.args[1], c.kwargs.get("hi"))
+        for c in calls.call_args_list
+        if c.args[2] is None and not c.kwargs.get("page_size")
+    ]
     probed = {c.args[1] for c in probes.call_args_list}
     assert any(hi is not None and lo for lo, hi in opened)
     assert all(hi is None for lo, hi in opened if lo in probed)
@@ -234,20 +238,11 @@ def test_scandir_ranges_see_past_unlisted_keys(client, tree, mocker):
         client.fs.pipe_file(f"{client.uri}/m//{i:02}", b"x")
     mocker.patch.object(type(client), "LIST_PAGE_SIZE", 4)
     mocker.patch("datachain.client.fsspec.LIST_WORKERS", 3)
-    pages = 0
-    pages_after = type(client)._pages_after
-
-    async def counted(self, prefix, start_after, keep, page_size=None, hi=None):
-        nonlocal pages
-        async for page in pages_after(self, prefix, start_after, keep, page_size, hi):
-            pages += 1
-            yield page
-
-    mocker.patch.object(type(client), "_pages_after", counted)
+    calls = mocker.spy(client, "_list_page")
 
     expected = sorted(_paths(tree))
     assert sorted(e.path for e in scandir(client, "")) == expected
-    assert pages <= 2 * (len(expected) + 60) // 4
+    assert calls.call_count <= 2 * (len(expected) + 60) // 4
 
 
 @pytest.mark.parametrize("cloud_type", ["s3", "gs", "azure"], indirect=True)
@@ -256,16 +251,16 @@ def test_scandir_builds_no_files_past_range_ends(client, tree, mocker):
     mocker.patch.object(type(client), "LIST_PAGE_SIZE", 4)
     mocker.patch("datachain.client.fsspec.LIST_WORKERS", 3)
     ranges = files = 0
-    pages_after = type(client)._pages_after
+    list_page = type(client)._list_page
 
-    async def counted(self, prefix, start_after, keep, page_size=None, hi=None):
+    async def counted(self, prefix, start_after, token, *args, **kwargs):
         nonlocal ranges, files
-        ranges += 1
-        async for page in pages_after(self, prefix, start_after, keep, page_size, hi):
-            files += len(page[0])
-            yield page
+        page = await list_page(self, prefix, start_after, token, *args, **kwargs)
+        ranges += token is None
+        files += len(page.rows)
+        return page
 
-    mocker.patch.object(type(client), "_pages_after", counted)
+    mocker.patch.object(type(client), "_list_page", counted)
 
     assert len(scandir(client, "")) == len(tree)
     assert ranges > 1
@@ -290,7 +285,7 @@ def test_gcs_listing_ends_at_hi(client, tree, mocker):
 
     async def listed():
         pages = client._pages_after("", lo, lambda _: True, hi=hi)
-        return [f async for f, _, _ in pages]
+        return [p.rows async for p in pages]
 
     sync(get_loop(), listed)
     assert read == keys[10:21]  # startOffset includes the start key
@@ -301,12 +296,12 @@ def test_gcs_listing_ends_at_hi(client, tree, mocker):
 def test_scandir_out_of_key_order_is_one_range(client, tree, mocker):
     mocker.patch.object(type(client), "LIST_PAGE_SIZE", 4)
     mocker.patch.object(type(client), "_lists_in_key_order", return_value=False)
-    ranges = mocker.spy(client, "_pages_after")
+    ranges = mocker.spy(client, "_list_page")
 
     paths = [e.path for e in scandir(client, "")]
 
     assert sorted(paths) == sorted(_paths(tree))
-    assert ranges.call_count == 1
+    assert [c.args[2] for c in ranges.call_args_list].count(None) == 1
 
 
 PREFIXED_TREE = {
@@ -328,12 +323,12 @@ PREFIXED_TREE = {
 @pytest.mark.parametrize("processes", [False, True])
 def test_scandir_requests_stay_inside_the_prefix(client, tree, processes, mocker):
     mocker.patch.object(type(client), "LIST_PAGE_SIZE", 4)
-    calls = mocker.spy(client, "_pages_after")
+    calls = mocker.spy(client, "_list_page")
 
     async def listed():
         paths = []
         async for entries in client.scandir("n2", processes=processes):
-            paths.extend(item_path(e) for e in entries)
+            paths.extend(e.path for e in entries)
         return paths
 
     expected = [p for p in _paths(tree) if p.startswith("n2/")]
@@ -351,7 +346,7 @@ def test_scandir_versions_of_one_key_stay_inside_the_prefix(client, tree, mocker
     for i in range(1, 10):
         client.fs.pipe_file(f"{client.uri}/d/b.txt", str(i).encode())
     mocker.patch.object(type(client), "LIST_PAGE_SIZE", 4)
-    calls = mocker.spy(client, "_pages_after")
+    calls = mocker.spy(client, "_list_page")
 
     assert len(scandir(client, "d")) == 10
     assert all(c.args[1].startswith("d/") for c in calls.call_args_list if c.args[1])
@@ -377,7 +372,7 @@ def test_scandir_lists_keys_past_the_basic_multilingual_plane(
     async def listed():
         paths = []
         async for entries in client.scandir("", processes=processes):
-            paths.extend(item_path(e) for e in entries)
+            paths.extend(e.path for e in entries)
         return paths
 
     assert sorted(sync(get_loop(), listed)) == sorted(_paths(tree))
@@ -405,7 +400,7 @@ def test_prefix_of_only_delete_markers_is_not_found(client, tree):
 
 @pytest.mark.parametrize("cloud_type", ["s3", "gs", "azure"], indirect=True)
 def test_scandir_one_page_is_one_range(client, mocker):
-    ranges = mocker.spy(client, "_pages_after")
+    ranges = mocker.spy(client, "_list_page")
     assert scandir(client, "")
     assert ranges.call_count == 1
 

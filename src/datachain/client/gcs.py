@@ -1,6 +1,6 @@
 import json
 import os
-from collections.abc import AsyncGenerator, Callable
+from collections.abc import Callable
 from datetime import datetime
 from typing import TYPE_CHECKING, Any, BinaryIO, cast
 from urllib.parse import quote
@@ -220,37 +220,35 @@ class GCSClient(Client):
 
     _fetch_default = _fetch_flat = Client._fetch_ranges
 
-    async def _pages_after(
+    async def _list_page(
         self,
         prefix: str,
         start_after: str,
+        token: Any,
         keep: Callable[[str], bool],
         page_size: int | None = None,
         hi: str | None = None,
-    ) -> AsyncGenerator[Page, None]:
-        token = None
-        while True:
-            page = await self.fs._call(
-                "GET",
-                "b/{}/o",
-                self.name,
-                delimiter="",
-                prefix=prefix,
-                startOffset=start_after or None,
-                endOffset=None if hi is None else f"{hi}\0",  # exclusive
-                maxResults=page_size or self.LIST_PAGE_SIZE,
-                pageToken=token,
-                json_out=True,
-                versions="true" if self._is_version_aware() else "false",
-            )
-            items = page.get("items", [])
-            yield (
-                [self._row(d) for d in items if keep(d["name"])],
-                items[0]["name"] if items else None,
-                items[-1]["name"] if items else None,
-            )
-            if (token := page.get("nextPageToken")) is None:
-                return
+    ) -> Page:
+        page = await self.fs._call(
+            "GET",
+            "b/{}/o",
+            self.name,
+            delimiter="",
+            prefix=prefix,
+            startOffset=start_after or None,
+            endOffset=None if hi is None else f"{hi}\0",  # exclusive
+            maxResults=page_size or self.LIST_PAGE_SIZE,
+            pageToken=token,
+            json_out=True,
+            versions="true" if self._is_version_aware() else "false",
+        )
+        items = page.get("items", [])
+        return Page(
+            [self._row(d) for d in items if keep(d["name"])],
+            items[0]["name"] if items else None,
+            items[-1]["name"] if items else None,
+            page.get("nextPageToken"),
+        )
 
     def _row(self, d: dict[str, Any]) -> tuple:
         return FileRow(

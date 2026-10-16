@@ -7,15 +7,12 @@ import signal
 import struct
 import sys
 import threading
-from collections.abc import AsyncGenerator
-from contextlib import aclosing, suppress
+from contextlib import suppress
 from functools import partial
 from typing import TYPE_CHECKING, Any, BinaryIO
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
-
-    from datachain.client.fsspec import Client
+    from datachain.client.fsspec import Client, Page
 
 logger = logging.getLogger("datachain")
 
@@ -69,48 +66,10 @@ def usable_cpus() -> int:
 
 PROCESSES = 0 if usable_cpus() < 2 else min(4, usable_cpus())
 FRAME = struct.Struct("<Q")
-# files, first key, last key; files are ``FileRow`` rows
-RangePage = tuple[list[Any], str | None, str | None]
-
-
-class Bound:
-    """The upper end of a range ``(lo, hi]``; it only shrinks, by a split. Keys
-    compare in ``order``, the server's order."""
-
-    def __init__(self, hi: str | None, order: "Callable[[str], Any]") -> None:
-        self.order = order
-        self.hi = hi
-        self.on_shrink: Callable[[str], None] | None = None
-        self.last: str | None = None  # the last key read so far
-        self.first: str | None = None  # the first key of the last page
-        self.pages = 0  # read by this range and the ranges it split off from
-        self.probing = False  # a split waits for its probe
-        self.done = False
-
-    @property
-    def hi(self) -> str | None:
-        return self._hi
-
-    @hi.setter
-    def hi(self, hi: str | None) -> None:
-        self._hi = hi
-        self._hi_key = None if hi is None else self.order(hi)
-
-    def shrink(self, hi: str) -> None:
-        self.hi = hi
-        if self.on_shrink:
-            self.on_shrink(hi)
-
-    def keeps(self, key: str) -> bool:
-        return self._hi_key is None or self.order(key) <= self._hi_key
 
 
 class ChildDied(Exception):  # noqa: N818
     pass
-
-
-def item_path(item: Any) -> str:
-    return item[1] if isinstance(item, tuple) else item.path  # path is column 1
 
 
 def _pickles(value: Any) -> bool:
@@ -156,7 +115,7 @@ def load(stream: BinaryIO) -> Any:
 class Child:
     def __init__(self) -> None:
         self.proc: asyncio.subprocess.Process | None = None
-        self.ranges: dict[int, asyncio.Queue] = {}
+        self.replies: dict[int, asyncio.Future] = {}
         self.died = asyncio.Event()
 
     async def start(self, spec: bytes) -> None:
@@ -176,8 +135,10 @@ class Child:
 
     def send_raw(self, data: bytes) -> None:
         assert self.proc and self.proc.stdin
-        if not self.died.is_set():
-            self.proc.stdin.write(data)
+        if self.died.is_set() or self.proc.stdin.is_closing():
+            self.kill()
+            raise ChildDied
+        self.proc.stdin.write(data)
 
     def send(self, *frame: Any) -> None:
         self.send_raw(dump(frame))
@@ -191,36 +152,36 @@ class Child:
         try:
             while True:
                 kind, rid, *rest = await self.read()
-                if (queue := self.ranges.get(rid)) is not None:
-                    await queue.put((kind, *rest))
+                if (reply := self.replies.pop(rid, None)) and not reply.done():
+                    if kind == "page":
+                        reply.set_result(rest)
+                    else:
+                        reply.set_exception(rest[0])
         except (asyncio.IncompleteReadError, ConnectionError):
             pass
         finally:
-            self.died.set()
+            self.kill()
 
-    async def get(self, queue: asyncio.Queue) -> tuple:
-        if queue.empty() and self.died.is_set():
-            raise ChildDied
-        get = asyncio.ensure_future(queue.get())
-        died = asyncio.ensure_future(self.died.wait())
+    async def list_page(self, rid: int, *request: Any) -> Any:
+        self.send("page", rid, *request)
+        reply = self.replies[rid] = asyncio.get_running_loop().create_future()
         try:
-            await asyncio.wait([get, died], return_when=asyncio.FIRST_COMPLETED)
+            return await reply
         finally:
-            died.cancel()
-            if not get.done():
-                get.cancel()
-        if not get.done():
-            raise ChildDied
-        return get.result()
+            self.replies.pop(rid, None)
 
     def kill(self) -> None:
         self.died.set()
+        for reply in self.replies.values():
+            if not reply.done():
+                reply.set_exception(ChildDied())
+        self.replies.clear()
         if self.proc and self.proc.returncode is None:
             self.proc.kill()
 
 
 class Pool:
-    """Child processes listing ranges for one ``Client._fetch_ranges`` call."""
+    """Child processes fetching pages for one ``Client._fetch_ranges`` call."""
 
     def __init__(self, client: "Client", prefix: str, size: int = 0) -> None:
         try:
@@ -278,46 +239,28 @@ class Pool:
             logger.warning("Listing in one process: no listing process runs")
 
     def ready(self) -> bool:
-        return bool(self.children)
+        return any(not c.died.is_set() for c in self.children)
 
-    def usable(self) -> bool:
-        """Whether a range may still move to a child process."""
-        return bool(self.size) and (
-            not self.tasks
-            or bool(self.children)
-            or not all(t.done() for t in self.tasks)
-        )
-
-    async def pages(
-        self, prefix: str, lo: str, bound: Bound
-    ) -> AsyncGenerator[RangePage, None]:
+    async def list_page(
+        self, prefix: str, start_after: str, token: Any, hi: str | None
+    ) -> "Page":
+        """The page after ``token`` (or after ``start_after``) from a child;
+        ``ChildDied`` when the child is gone before it replies."""
         from datachain.lib.file import FileRow
 
-        if not self.children:
+        from .fsspec import Page
+
+        live = [c for c in self.children if not c.died.is_set()]
+        if not live:
             raise ChildDied
-        file_row = partial(tuple.__new__, FileRow)
-        child = min(self.children, key=lambda c: len(c.ranges))
+        child = min(live, key=lambda c: len(c.replies))
         rid = self.next_id = self.next_id + 1
-        queue: asyncio.Queue = asyncio.Queue(2)
-        child.ranges[rid] = queue
-        child.send("open", rid, prefix, lo, bound.hi)
-        bound.on_shrink = lambda hi: child.send("hi", rid, hi)
-        try:
-            while True:
-                kind, *rest = await child.get(queue)
-                if kind == "page":
-                    files, first, last = rest
-                    yield list(map(file_row, files)), first, last
-                elif kind == "end":
-                    return
-                else:
-                    raise rest[0]
-        finally:
-            bound.on_shrink = None
-            del child.ranges[rid]
-            child.send("close", rid)
-            while not queue.empty():  # a reader blocked on this queue moves on
-                queue.get_nowait()
+        rows, first, last, token = await child.list_page(
+            rid, prefix, start_after, token, hi
+        )
+        return Page(
+            list(map(partial(tuple.__new__, FileRow), rows)), first, last, token
+        )
 
     def close(self) -> None:
         self.closed = True
@@ -327,9 +270,7 @@ class Pool:
             child.kill()
 
 
-async def _serve(  # noqa: C901
-    client: "Client", prefix: str, inp: BinaryIO, out: BinaryIO
-) -> None:
+async def _serve(client: "Client", prefix: str, inp: BinaryIO, out: BinaryIO) -> None:
     loop = asyncio.get_running_loop()
     inbox: asyncio.Queue = asyncio.Queue()
 
@@ -345,29 +286,18 @@ async def _serve(  # noqa: C901
         except BrokenPipeError:  # the parent is gone
             os._exit(0)
 
-    tasks: dict[int, asyncio.Task] = {}
-    bounds: dict[int, Bound] = {}
-
-    async def run(rid: int, prefix: str, lo: str) -> None:
-        bound = bounds[rid]
-        error: Exception | None = None
+    async def run(rid: int, prefix: str, start_after: str, token: Any, hi) -> None:
         try:
-            pages = client._local_pages(prefix, lo, bound)
-            async with aclosing(pages):
-                async for files, first, last in pages:
-                    # plain tuples: a row type would unpickle per row in Python
-                    write("page", rid, [tuple(f) for f in files], first, last)
-                    if last is not None and not bound.keeps(last):
-                        break
-            write("end", rid)
+            page = await client._list_page(
+                prefix, start_after, token, client._keeps(hi), hi=hi
+            )
         except Exception as e:  # noqa: BLE001
-            error = e
-        finally:
-            tasks.pop(rid, None)
-            bounds.pop(rid, None)
-        if error is not None:
-            write("error", rid, picklable(error))
+            write("error", rid, picklable(e))
+        else:
+            # plain tuples: a row type would unpickle per row in Python
+            write("page", rid, [tuple(r) for r in page.rows], *page[1:])
 
+    tasks: set[asyncio.Task] = set()
     threading.Thread(target=pump, daemon=True).start()
     try:  # warm up DNS, TLS, credentials and the bucket region before taking work
         await client._probe(prefix, "")
@@ -376,16 +306,10 @@ async def _serve(  # noqa: C901
         return
     write("ready", None)
     while (msg := await inbox.get()) is not None:
-        kind, rid, *args = msg
-        if kind == "open":
-            prefix, lo, hi = args
-            bounds[rid] = Bound(hi, client.key_order)
-            tasks[rid] = asyncio.create_task(run(rid, prefix, lo))
-        elif kind == "hi" and rid in bounds:
-            bounds[rid].hi = args[0]
-        elif kind == "close" and rid in tasks:
-            tasks[rid].cancel()
-    for task in list(tasks.values()):
+        _, rid, *request = msg
+        tasks.add(task := asyncio.create_task(run(rid, *request)))
+        task.add_done_callback(tasks.discard)
+    for task in list(tasks):
         task.cancel()
 
 

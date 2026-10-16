@@ -8,7 +8,7 @@ from fsspec.asyn import sync
 import datachain as dc
 from datachain.asyn import get_loop
 from datachain.client import Client
-from datachain.client.listing_worker import Child, Pool, item_path
+from datachain.client.listing_worker import Child, Pool
 from datachain.lib.convert.flatten import flatten
 from datachain.lib.file import File, FileRow
 from datachain.lib.listing import list_bucket
@@ -37,35 +37,34 @@ def children(client, mocker):
     """Children of the listing; once they are starting, the parent lists no
     further page until one runs, so every listing past two pages moves to them."""
     started: list[Pool] = []
-    pool_start, local_pages = Pool.start, type(client)._local_pages
+    pool_start, list_page = Pool.start, type(client)._list_page
 
     def start(self):
         started.append(self)
         pool_start(self)
 
-    async def gated(self, prefix, lo, bound, limit=None):
-        async for page in local_pages(self, prefix, lo, bound, limit):
-            deadline = time.monotonic() + 30
-            while starting(started) and time.monotonic() < deadline:  # noqa: ASYNC110
-                await asyncio.sleep(0.01)
-            yield page
+    async def gated(self, *args, **kwargs):
+        deadline = time.monotonic() + 30
+        while starting(started) and time.monotonic() < deadline:  # noqa: ASYNC110
+            await asyncio.sleep(0.01)
+        return await list_page(self, *args, **kwargs)
 
     mocker.patch.object(Pool, "start", start)
-    mocker.patch.object(type(client), "_local_pages", gated)
+    mocker.patch.object(type(client), "_list_page", gated)
     return started
 
 
 @pytest.fixture
 def remote_rows(mocker):
     got: list = []
-    pages = Pool.pages
+    list_page = Pool.list_page
 
-    async def recorded(self, prefix, lo, bound):
-        async for page in pages(self, prefix, lo, bound):
-            got.extend(page[0])
-            yield page
+    async def recorded(self, *args):
+        page = await list_page(self, *args)
+        got.extend(page.rows)
+        return page
 
-    mocker.patch.object(Pool, "pages", recorded)
+    mocker.patch.object(Pool, "list_page", recorded)
     return got
 
 
@@ -94,10 +93,22 @@ def rows(items):
 @pytest.mark.parametrize("cloud_type", ["s3", "gs", "azure"], indirect=True)
 @pytest.mark.parametrize("tree", [TREE], indirect=True)
 @pytest.mark.parametrize("prefix", ["", "big", "flat"])
-def test_listing_in_children_is_exact(client, tree, prefix, children, remote_rows):
+def test_listing_in_children_is_exact(
+    client, tree, prefix, children, remote_rows, mocker
+):
+    died = []
+    run = Pool._run
+
+    async def recorded(self):
+        await run(self)  # cancelled when the pool closes
+        died.append(self)
+
+    mocker.patch.object(Pool, "_run", recorded)
+
     items = sync(get_loop(), _items, client, prefix, True)
 
     assert remote_rows
+    assert not died
     assert rows(items) == listing(client, prefix, processes=False)
 
 
@@ -113,7 +124,37 @@ def test_versions_across_pages_are_exact(client, tree, children, remote_rows):
 
     assert remote_rows
     assert rows(items) == listing(client, processes=False)
-    assert sum(item_path(i) == "big/030" for i in items) == 10
+    assert sum(i.path == "big/030" for i in items) == 10
+
+
+# fake-gcs-server repeats a page forever when one key's versions span pages
+@pytest.mark.parametrize("cloud_type", ["s3"], indirect=True)
+@pytest.mark.parametrize("version_aware", [True], indirect=True)
+@pytest.mark.parametrize("tree", [TREE], indirect=True)
+def test_a_child_killed_inside_one_keys_versions_loses_none(
+    client, tree, children, remote_rows, mocker
+):
+    for i in range(29):
+        client.fs.pipe_file(f"{client.uri}/big/030", str(i).encode())
+    killed = []
+    read = Child.read
+
+    async def kill_inside_the_key(self):
+        frame = await read(self)
+        page = frame[2] if frame[0] == "page" else []
+        if any(row[1] == "big/030" for row in page) and len(killed) < 2:
+            killed.append(self)
+            self.proc.kill()
+        return frame
+
+    mocker.patch.object(Child, "read", kill_inside_the_key)
+
+    items = sync(get_loop(), _items, client, "", True)
+
+    expected = listing(client, processes=False)
+    assert killed
+    assert rows(items) == expected
+    assert sum(r[1] == "big/030" for r in expected) >= 30
 
 
 @pytest.mark.parametrize("cloud_type", ["s3", "gs", "azure"], indirect=True)
@@ -239,24 +280,18 @@ def requests_in_flight(client, mocker):
     """The most page requests the parent had open at once."""
     peak = [0]
     now = 0
-    pages_after = type(client)._pages_after
+    list_page = type(client)._list_page
 
     async def counted(self, *args, **kwargs):
         nonlocal now
-        pages = pages_after(self, *args, **kwargs)
-        async with aclosing(pages):
-            while True:
-                now += 1
-                peak[0] = max(peak[0], now)
-                try:
-                    page = await anext(pages)
-                except StopAsyncIteration:
-                    return
-                finally:
-                    now -= 1
-                yield page
+        now += 1
+        peak[0] = max(peak[0], now)
+        try:
+            return await list_page(self, *args, **kwargs)
+        finally:
+            now -= 1
 
-    mocker.patch.object(type(client), "_pages_after", counted)
+    mocker.patch.object(type(client), "_list_page", counted)
     return peak
 
 

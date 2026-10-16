@@ -326,9 +326,10 @@ def _listed(blobs: str) -> tuple[AzureClient, list]:
 
     class Pages:
         _response = page
+        continuation_token = None
+        done = False
 
         def __aiter__(self):
-            self.done = False
             return self
 
         async def __anext__(self):

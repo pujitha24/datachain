@@ -2,19 +2,19 @@ import asyncio
 import io
 import os
 import pickle
+import random
 import subprocess
 import sys
-from collections import namedtuple
-from typing import ClassVar
 
 import pytest
+from fsspec.asyn import get_loop, sync
 
 import datachain
 from datachain.client import listing_worker
-from datachain.client.fsspec import Client
+from datachain.client.fsspec import Client, Page
 from datachain.client.listing_worker import (
-    Bound,
     Child,
+    ChildDied,
     Pool,
     _cpu_quotas,
     _serve,
@@ -23,6 +23,7 @@ from datachain.client.listing_worker import (
     picklable,
     usable_cpus,
 )
+from datachain.lib.file import FileRow
 
 ROOT = os.path.dirname(os.path.dirname(datachain.__file__))
 
@@ -108,84 +109,162 @@ def test_azure_errors_cross_the_pipe():
     assert "request failed" in str(sent)
 
 
-def test_pool_is_usable_until_every_child_is_gone():
+class VersionsClient(Client):
+    """One key with many versions, then one more key, in pages of 4."""
+
+    PREFIX = "fake://"
+    protocol = "fake"
+    LIST_PAGE_SIZE = 4
+    _fetch_default = Client._fetch_ranges
+
+    def __init__(self, versions: int) -> None:
+        super().__init__("bucket", {}, None)  # type: ignore[arg-type]
+        self.keys = [("a", f"v{i:06}") for i in range(versions)] + [("b", "v0")]
+        self.requests = 0
+
+    def info_to_file(self, v, path):
+        raise NotImplementedError
+
+    async def _list_page(
+        self, prefix, start_after, token, keep, page_size=None, hi=None
+    ) -> Page:
+        self.requests += 1
+        if token is None:
+            token = next(
+                (i for i, (k, _) in enumerate(self.keys) if k > start_after),
+                len(self.keys),
+            )
+        chunk = self.keys[token : token + (page_size or self.LIST_PAGE_SIZE)]
+        end = token + len(chunk)
+        return Page(
+            [FileRow("fake://bucket", k, 1, v) for k, v in chunk if keep(k)],
+            chunk[0][0] if chunk else None,
+            max((k for k, _ in chunk), default=None),
+            end if end < len(self.keys) else None,
+        )
+
+
+class SlowClient(Client):
+    """Keys with a few versions each; every request takes a random while."""
+
+    PREFIX = "fake://"
+    protocol = "fake"
+    LIST_PAGE_SIZE = 4
+    _fetch_default = Client._fetch_ranges
+
+    def __init__(self, seed: int) -> None:
+        super().__init__("bucket", {}, None)  # type: ignore[arg-type]
+        self.rng = random.Random(seed)  # noqa: S311
+        names = {
+            "".join(self.rng.choices("ab/0123456789", k=self.rng.randint(1, 6)))
+            for _ in range(300)
+        }
+        self.keys = [
+            (name, f"v{v}")
+            for name in sorted(names)
+            for v in range(self.rng.choice([1, 1, 1, 3, 9]))
+        ]
+
+    def info_to_file(self, v, path):
+        raise NotImplementedError
+
+    async def _list_page(
+        self, prefix, start_after, token, keep, page_size=None, hi=None
+    ) -> Page:
+        await asyncio.sleep(self.rng.random() / 200)
+        if token is None:
+            token = next(
+                (i for i, (k, _) in enumerate(self.keys) if k > start_after),
+                len(self.keys),
+            )
+        chunk = self.keys[token : token + (page_size or self.LIST_PAGE_SIZE)]
+        end = token + len(chunk)
+        return Page(
+            [FileRow("fake://bucket", k, 1, v) for k, v in chunk if keep(k)],
+            chunk[0][0] if chunk else None,
+            max((k for k, _ in chunk), default=None),
+            end if end < len(self.keys) else None,
+        )
+
+
+@pytest.mark.parametrize("seed", range(40))
+def test_ranges_that_split_while_pages_are_in_flight_are_exact(seed, mocker):
+    mocker.patch("datachain.client.fsspec.LIST_WORKERS", 8)
+    mocker.patch("datachain.client.fsspec.YOUNG_PAGES", 1)
+    client = SlowClient(seed)
+
+    pages = _listed(client, processes=False)
+
+    expected = [k for k in client.keys if client._is_valid_key(k[0])]
+    assert sorted((r.path, r.version) for p in pages for r in p) == expected
+
+
+def _listed(client: Client, processes: bool = True) -> list[list]:
+    async def pages():
+        return [
+            page async for page in client.scandir("", processes=processes, rows=True)
+        ]
+
+    return sync(get_loop(), pages)
+
+
+@pytest.mark.parametrize("processes", [False, True])
+def test_versions_of_one_key_take_linear_work_and_bounded_memory(processes, mocker):
+    async def starting(self, spec):
+        await asyncio.sleep(3600)
+
+    mocker.patch.object(Child, "start", starting)
+    pages = {}
+    for versions in (100, 200):
+        client = VersionsClient(versions)
+        pages[versions] = _listed(client, processes)
+        rows = [(r.path, r.version) for page in pages[versions] for r in page]
+        assert sorted(rows) == sorted(client.keys)
+        assert client.requests <= versions // 4 + 2
+
+    assert max(len(page) for page in pages[200]) <= VersionsClient.LIST_PAGE_SIZE
+
+
+def test_short_listing_takes_a_request_per_page_and_no_children(mocker):
+    start = mocker.spy(Pool, "start")
+    client = VersionsClient(4)  # 5 keys in 4-key pages
+
+    assert sum(map(len, _listed(client))) == 5
+    assert client.requests == 2
+    assert not start.call_count
+
+
+def test_a_child_with_a_broken_pipe_takes_no_more_pages():
     async def check():
-        pool = Pool.__new__(Pool)
-        pool.size, pool.tasks, pool.children = 0, [], []
-        assert not pool.usable()
+        pool = Pool(VersionsClient(1), "")
+        child = Child()
+        child.proc = type("Proc", (), {"returncode": 0})()
+        child.proc.stdin = type("Pipe", (), {"is_closing": lambda self: True})()
+        pool.children = [child]
 
-        pool.size = 2
-        assert pool.usable()
-
-        pool.tasks = [asyncio.create_task(asyncio.sleep(0))]
-        assert pool.usable()
-        await pool.tasks[0]
-        assert not pool.usable()
+        with pytest.raises(ChildDied):
+            await pool.list_page("", "", None, None)
+        assert not pool.ready()
+        assert not child.replies
+        with pytest.raises(ChildDied):
+            await pool.list_page("", "", None, None)
 
     asyncio.run(check())
 
 
-FileRow = namedtuple(  # noqa: PYI024
-    "FileRow", "source path size version etag is_latest last_modified location"
-)
-
-
-def _file(path: str, version: str) -> FileRow:
-    return FileRow("s3://bucket", path, 1, version, "", True, None, None)
-
-
-class VersionsClient:
-    name, cache, LIST_PAGE_SIZE = "bucket", None, 1
-    fs_kwargs: ClassVar[dict] = {}
-    _range_pages = Client._range_pages
-    _local_pages = Client._local_pages
-
-    def _lists_in_key_order(self):
-        return True
-
-    def _is_valid_key(self, key):
-        return True
-
-    key_order = staticmethod(Client.key_order)
-
-    async def _pages_after(self, prefix, lo, keep, hi=None):
-        for key, version in [("a", "v1"), ("a", "v2"), ("b", "v1")]:
-            if key > lo:
-                yield ([_file(key, version)] if keep(key) else []), key, key
-
-
-def test_versions_survive_the_last_child_dying_mid_key(monkeypatch):
+def test_a_child_that_dies_fails_its_pending_pages():
     async def check():
-        opened = asyncio.Event()
-
-        async def start(self, spec):
-            pass
-
-        def send(self, *frame):
-            if frame[0] == "open":
-                self.rid = frame[1]
-                opened.set()
-
-        async def read(self):
-            await opened.wait()
-            if not getattr(self, "sent", False):
-                self.sent = True
-                return ("page", self.rid, [tuple(_file("a", "v1"))], "a", "a")
-            raise asyncio.IncompleteReadError(b"", 8)
-
-        monkeypatch.setattr(Child, "start", start)
-        monkeypatch.setattr(Child, "send", send)
-        monkeypatch.setattr(Child, "read", read)
-        client = VersionsClient()
-        pool = Pool(client, "", 1)
-        pool.start()
+        child = Child()
+        child.proc = type("Proc", (), {"returncode": 0})()
+        child.proc.stdin = type(
+            "Pipe", (), {"is_closing": lambda self: False, "write": lambda s, d: None}
+        )()
+        pending = asyncio.create_task(child.list_page(1, "", "", None, None))
         await asyncio.sleep(0)
+        child.kill()
 
-        async def versions(pool):
-            pages = client._range_pages("", "", Bound(None, Client.key_order), pool)
-            return [(f[1], f[3]) async for files, _, _ in pages for f in files]
-
-        assert await versions(pool) == await versions(None)
+        with pytest.raises(ChildDied):
+            await pending
 
     asyncio.run(check())
 

@@ -1,5 +1,5 @@
 import shutil
-from collections.abc import AsyncGenerator, Callable, Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from email.utils import parsedate_to_datetime
 from tempfile import SpooledTemporaryFile
@@ -266,15 +266,16 @@ class AzureClient(Client):
         # a hierarchical namespace lists "/" before every other character
         return not self._hns
 
-    async def _pages_after(
+    async def _list_page(
         self,
         prefix: str,
         start_after: str,
+        token: Any,
         keep: Callable[[str], bool],
         page_size: int | None = None,
         hi: str | None = None,
-    ) -> AsyncGenerator[Page, None]:
-        kwargs = {"start_from": start_after} if start_after else {}
+    ) -> Page:
+        kwargs = {"start_from": start_after} if start_after and token is None else {}
         async with self.fs.service_client.get_container_client(
             container=self.name
         ) as container:
@@ -284,23 +285,27 @@ class AzureClient(Client):
                 name_starts_with=prefix,
                 results_per_page=page_size or self.LIST_PAGE_SIZE,
                 **kwargs,
-            ).by_page()
-            async for _ in pages:
-                blobs = pages._response.find("Blobs").findall("Blob")
-                # only a hierarchical namespace reports a resource type
-                if blobs and blobs[0].find("Properties/ResourceType") is not None:
-                    self._hns = True
-                names = [self._blob_name(b) for b in blobs]
-                files = [
-                    self._xml_to_row(b, n)
-                    for b, n in zip(blobs, names, strict=True)
-                    if keep(n) and not self._is_directory(b)
-                ]
-                yield (
-                    files,
-                    names[0] if names else None,
-                    names[-1] if names else None,
-                )
+            ).by_page(continuation_token=token)
+            try:
+                await anext(pages)
+            except StopAsyncIteration:
+                return Page([], None, None, None)
+            blobs = pages._response.find("Blobs").findall("Blob")
+            next_token = pages.continuation_token or None
+        # only a hierarchical namespace reports a resource type
+        if blobs and blobs[0].find("Properties/ResourceType") is not None:
+            self._hns = True
+        names = [self._blob_name(b) for b in blobs]
+        return Page(
+            [
+                self._xml_to_row(b, n)
+                for b, n in zip(blobs, names, strict=True)
+                if keep(n) and not self._is_directory(b)
+            ],
+            names[0] if names else None,
+            names[-1] if names else None,
+            next_token,
+        )
 
     @staticmethod
     def _is_directory(blob: Element) -> bool:

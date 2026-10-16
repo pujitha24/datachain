@@ -1,5 +1,5 @@
 import os
-from collections.abc import AsyncGenerator, Callable
+from collections.abc import Callable
 from datetime import datetime
 from typing import TYPE_CHECKING, Any, cast
 from xml.etree.ElementTree import Element, ParseError, fromstring
@@ -295,36 +295,51 @@ class ClientS3(Client):
         # directory buckets neither sort keys nor take StartAfter
         return not self.name.endswith("--x-s3")
 
-    async def _pages_after(
+    async def _list_page(
         self,
         prefix: str,
         start_after: str,
+        token: Any,
         keep: Callable[[str], bool],
         page_size: int | None = None,
         hi: str | None = None,
-    ) -> AsyncGenerator[Page, None]:
+    ) -> Page:
         versions = self._is_version_aware()
-        method, key, start = (
-            ("list_object_versions", "Versions", "KeyMarker")
-            if versions
-            else ("list_objects_v2", "Contents", "StartAfter")
-        )
+        kwargs: dict[str, Any] = {}
+        if versions:
+            if token is not None:
+                kwargs["KeyMarker"], version_marker = token
+                if version_marker:
+                    kwargs["VersionIdMarker"] = version_marker
+            elif start_after:
+                kwargs["KeyMarker"] = start_after
+        elif token is not None:
+            kwargs["ContinuationToken"] = token
+        elif start_after:
+            kwargs["StartAfter"] = start_after
         await self.fs.set_session()
         s3 = await self.fs.get_s3(self.name)
-        kwargs = {start: start_after} if start_after else {}
-        async for page in s3.get_paginator(method).paginate(
+        list_page = s3.list_object_versions if versions else s3.list_objects_v2
+        page = await list_page(
             Bucket=self.name,
             Prefix=prefix,
-            PaginationConfig={"PageSize": page_size or self.LIST_PAGE_SIZE},
+            MaxKeys=page_size or self.LIST_PAGE_SIZE,
             **kwargs,
-        ):
-            entries = page.get(key, [])
-            keys = [d["Key"] for d in entries + page.get("DeleteMarkers", [])]
-            yield (
-                [self._row_from_boto(d, versions) for d in entries if keep(d["Key"])],
-                entries[0]["Key"] if entries else None,
-                max(keys, default=None),
-            )
+        )
+        entries = page.get("Versions" if versions else "Contents", [])
+        keys = [d["Key"] for d in entries + page.get("DeleteMarkers", [])]
+        if not page.get("IsTruncated"):
+            token = None
+        elif versions:
+            token = page["NextKeyMarker"], page.get("NextVersionIdMarker")
+        else:
+            token = page["NextContinuationToken"]
+        return Page(
+            [self._row_from_boto(d, versions) for d in entries if keep(d["Key"])],
+            entries[0]["Key"] if entries else None,
+            max(keys, default=None),
+            token,
+        )
 
     def _row_from_boto(self, v, versions: bool) -> tuple:
         return FileRow(
