@@ -311,13 +311,18 @@ def test_listing_asks_for_versions_only_when_version_aware(version_aware, includ
     assert container.list_blob_names.call_args.kwargs["include"] == include
 
 
-@pytest.mark.parametrize("resource_type", ["", "<ResourceType>file</ResourceType>"])
-def test_hierarchical_namespace_lists_out_of_key_order(resource_type):
-    page = fromstring(  # noqa: S314
-        "<EnumerationResults><Blobs><Blob><Name>a</Name><Properties>"
+def _blob(name: str, resource_type: str = "") -> str:
+    return (
+        f"<Blob><Name>{name}</Name><Properties>"
         "<Last-Modified>Wed, 30 Sep 2026 23:00:00 GMT</Last-Modified>"
         f"<Etag>0x8DC</Etag><Content-Length>1</Content-Length>{resource_type}"
-        "</Properties></Blob></Blobs></EnumerationResults>"
+        "</Properties></Blob>"
+    )
+
+
+def _listed(blobs: str) -> tuple[AzureClient, list]:
+    page = fromstring(  # noqa: S314
+        f"<EnumerationResults><Blobs>{blobs}</Blobs></EnumerationResults>"
     )
 
     class Pages:
@@ -342,9 +347,28 @@ def test_hierarchical_namespace_lists_out_of_key_order(resource_type):
     client._fs.service_client.get_container_client.return_value = container
 
     async def list_all():
-        async for _ in client.scandir(""):
-            pass
+        return [f.path async for page in client.scandir("") for f in page]
 
-    sync(get_loop(), list_all)
+    return client, sync(get_loop(), list_all)
+
+
+@pytest.mark.parametrize("resource_type", ["", "<ResourceType>file</ResourceType>"])
+def test_hierarchical_namespace_lists_out_of_key_order(resource_type):
+    client, _ = _listed(_blob("a", resource_type))
 
     assert client._lists_in_key_order() is (not resource_type)
+
+
+def test_hierarchical_namespace_directories_are_not_files():
+    directory = "<ResourceType>directory</ResourceType>"
+    file = "<ResourceType>file</ResourceType>"
+    blobs = [
+        _blob("dir", directory),
+        _blob("dir/f1", file),
+        _blob("dir/sub", directory),
+        _blob("dir/sub/f2", file),
+    ]
+
+    _, paths = _listed("".join(blobs))
+
+    assert paths == ["dir/f1", "dir/sub/f2"]

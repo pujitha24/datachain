@@ -21,16 +21,18 @@ from datachain.client.listing_worker import (
 class FakeClient:
     def __init__(self, out, fail=False):
         self.out, self.fail, self.probed_before_ready = out, fail, None
+        self.probed = None
 
     async def _probe(self, prefix, start_after):
         self.probed_before_ready = not self.out.getvalue()
+        self.probed = prefix, start_after
         if self.fail:
             raise PermissionError("no list access")
 
 
 def serve(client, out):
     inp = io.BytesIO()  # no requests: the child stops at end of input
-    asyncio.run(_serve(client, inp, out))
+    asyncio.run(_serve(client, "dir/", inp, out))
     out.seek(0)
     return load(out)
 
@@ -41,6 +43,7 @@ def test_child_warms_up_before_it_reports_ready():
 
     assert serve(client, out) == ("ready", None)
     assert client.probed_before_ready
+    assert client.probed == ("dir/", "")
 
 
 def test_child_reports_ready_when_warm_up_fails():
@@ -140,10 +143,12 @@ class VersionsClient:
     def _is_valid_key(self, key):
         return True
 
+    key_order = staticmethod(Client.key_order)
+
     async def _pages_after(self, prefix, lo, keep, hi=None):
         for key, version in [("a", "v1"), ("a", "v2"), ("b", "v1")]:
             if key > lo:
-                yield ([_file(key, version)] if keep(key) else []), key
+                yield ([_file(key, version)] if keep(key) else []), key, key
 
 
 def test_versions_survive_the_last_child_dying_mid_key(monkeypatch):
@@ -169,12 +174,12 @@ def test_versions_survive_the_last_child_dying_mid_key(monkeypatch):
         monkeypatch.setattr(Child, "send", send)
         monkeypatch.setattr(Child, "read", read)
         client = VersionsClient()
-        pool = Pool(client, 1)
+        pool = Pool(client, "", 1)
         pool.start()
         await asyncio.sleep(0)
 
         async def versions(pool):
-            pages = client._range_pages("", "", Bound(None), pool)
+            pages = client._range_pages("", "", Bound(None, Client.key_order), pool)
             return [(f[1], f[3]) async for files, _, _ in pages for f in files]
 
         assert await versions(pool) == await versions(None)

@@ -42,9 +42,13 @@ _SCALARS: dict[str, Callable[[str], Any]] = {
 Fields = dict[str, tuple[str, Callable[[Element], Any], bool]]
 
 
-@functools.cache
+_FIELDS: dict[str, Fields] = {}  # by shape name: every client builds its own shapes
+
+
 def _fields(shape: Shape) -> Fields:
     """Readers of a structure's child elements by XML tag."""
+    if (fields := _FIELDS.get(shape.name)) is not None:
+        return fields
     fields = {}
     for name, member in shape.members.items():
         repeated = member.type_name == "list"
@@ -53,6 +57,7 @@ def _fields(shape: Shape) -> Fields:
             _reader(member.member if repeated else member),
             repeated,
         )
+    _FIELDS[shape.name] = fields
     return fields
 
 
@@ -300,6 +305,7 @@ class ClientS3(Client):
             keys = [d["Key"] for d in entries + page.get("DeleteMarkers", [])]
             yield (
                 [self._row_from_boto(d, versions) for d in entries if keep(d["Key"])],
+                entries[0]["Key"] if entries else None,
                 max(keys, default=None),
             )
 

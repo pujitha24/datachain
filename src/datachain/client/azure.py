@@ -20,7 +20,7 @@ from fsspec.asyn import get_loop, sync
 from datachain.lib.convert.flatten import row_type
 from datachain.lib.file import File
 
-from .fsspec import BucketStatus, Client, Page
+from .fsspec import BucketStatus, Client, Page, utf16_units
 
 if TYPE_CHECKING:
     from datachain.client.writeconfig import WriteConfig
@@ -262,6 +262,10 @@ class AzureClient(Client):
     _fetch_default = _fetch_flat = Client._fetch_ranges
     _hns = False
 
+    @staticmethod
+    def key_order(key: str) -> Any:
+        return utf16_units(key)
+
     def _lists_in_key_order(self) -> bool:
         # a hierarchical namespace lists "/" before every other character
         return not self._hns
@@ -287,15 +291,24 @@ class AzureClient(Client):
             ).by_page()
             async for _ in pages:
                 blobs = pages._response.find("Blobs").findall("Blob")
+                # only a hierarchical namespace reports a resource type
                 if blobs and blobs[0].find("Properties/ResourceType") is not None:
                     self._hns = True
                 names = [self._blob_name(b) for b in blobs]
                 files = [
                     self._xml_to_row(b, n)
                     for b, n in zip(blobs, names, strict=True)
-                    if keep(n)
+                    if keep(n) and not self._is_directory(b)
                 ]
-                yield files, names[-1] if names else None
+                yield (
+                    files,
+                    names[0] if names else None,
+                    names[-1] if names else None,
+                )
+
+    @staticmethod
+    def _is_directory(blob: Element) -> bool:
+        return blob.findtext("Properties/ResourceType") == "directory"
 
     @staticmethod
     def _blob_name(blob: Element) -> str:

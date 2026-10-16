@@ -1,5 +1,4 @@
 import asyncio
-import contextlib
 import threading
 from collections.abc import (
     AsyncIterable,
@@ -220,6 +219,5 @@ def iter_over_async(ait: AsyncIterable[T], loop) -> Iterator[T]:
         if fetch is not None:
             fetch.cancel()
         if (aclose := getattr(ait, "aclose", None)) and loop.is_running():
-            # never masks what stopped the iteration, e.g. a KeyboardInterrupt
-            with contextlib.suppress(Exception):
-                asyncio.run_coroutine_threadsafe(aclose(), loop).result()
+            # not awaited: at shutdown, or on the loop's own thread, it never ends
+            asyncio.run_coroutine_threadsafe(aclose(), loop)

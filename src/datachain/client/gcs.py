@@ -250,6 +250,7 @@ class GCSClient(Client):
             items = page.get("items", [])
             yield (
                 [self._row(d) for d in items if keep(d["name"])],
+                items[0]["name"] if items else None,
                 items[-1]["name"] if items else None,
             )
             if (token := page.get("nextPageToken")) is None:

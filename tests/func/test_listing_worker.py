@@ -180,7 +180,7 @@ def test_children_stop_when_listing_is_closed_early(
 def test_config_that_does_not_pickle_lists_in_process(client, tree, remote_rows):
     client.fs_kwargs = {**client.fs_kwargs, "hook": lambda: None}
 
-    assert Pool(client, 2).size == 0
+    assert Pool(client, "", 2).size == 0
     items = sync(get_loop(), _items, client, "", True)
     assert items
     assert not remote_rows

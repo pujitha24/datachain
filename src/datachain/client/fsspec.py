@@ -54,8 +54,10 @@ DATA_SOURCE_URI_PATTERN = re.compile(r"^[\w]+:\/\/.*$")
 FRACTION = re.compile(r"(?<=\.)\d+")
 CLOUD_STORAGE_PROTOCOLS = {"s3", "gs", "az", "hf"}
 
-ResultQueue = asyncio.Queue[Sequence[Any]]  # File objects or row_type(File) rows
-Page = tuple[list[Any], str | None]  # File rows and the last key listed
+# pages of File objects or row_type(File) rows; None ends the listing
+ResultQueue = asyncio.Queue[Sequence[Any] | None]
+# File rows, and the first object and the last key of any kind listed
+Page = tuple[list[Any], str | None, str | None]
 
 
 def is_cloud_uri(uri: str) -> bool:
@@ -83,19 +85,33 @@ def iso_timestamp(value: str) -> datetime | None:
     return None
 
 
+def code_points(key: str) -> str:
+    return key
+
+
+def utf16_units(key: str) -> bytes:
+    return key.encode("utf-16-be", "surrogatepass")
+
+
 def key_midpoint(
     lo: str,
     hi: str | None,
     alphabet: Iterable[str],
     first: str | None = None,
     pages: int = SPLIT_PAGES,
+    prefix: str = "",
+    order: Callable[[str], Any] = code_points,
 ) -> str | None:
-    """Shortest key strictly between ``lo`` and ``hi`` (``None`` is the open end);
-    with ``first``, at most ``pages`` pages of ``first..lo`` past ``lo``."""
-    chars = sorted(set(alphabet) | set(lo) | set(hi or "") | set(first or ""))
+    """Shortest key strictly between ``lo`` and ``hi`` in ``order`` (``None`` is
+    the end of ``prefix``); with ``first``, at most ``pages`` pages of
+    ``first..lo`` past ``lo``."""
+    chars = sorted(
+        set(alphabet) | set(lo) | set(hi or "") | set(first or "") | set(prefix),
+        key=order,
+    )
     digit = {c: i + 1 for i, c in enumerate(chars)}
     base = len(chars) + 1
-    width = max(len(lo), len(hi or ""), len(first or "")) + 1
+    width = max(len(lo), len(hi or ""), len(first or ""), len(prefix)) + 1
 
     def value(key: str) -> int:
         n = 0
@@ -103,16 +119,20 @@ def key_midpoint(
             n = n * base + (digit[key[i]] if i < len(key) else 0)
         return n
 
-    n = (value(lo) + (base**width if hi is None else value(hi))) // 2
-    if first is not None and first < lo:
+    end = value(prefix) + base ** (width - len(prefix)) if hi is None else value(hi)
+    n = (value(lo) + end) // 2
+    if first is not None and order(first) < order(lo):
         n = min(n, value(lo) + (value(lo) - value(first)) * pages)
     digits = []
     for _ in range(width):
         n, d = divmod(n, base)
         digits.append(chars[max(d - 1, 0)])
     mid = "".join(reversed(digits))
-    mid = next((mid[:k] for k in range(1, len(mid) + 1) if mid[:k] > lo), mid)
-    return mid if lo < mid and (hi is None or mid < hi) else None
+    mid = next(
+        (mid[:k] for k in range(1, len(mid) + 1) if order(mid[:k]) > order(lo)), mid
+    )
+    inside = order(lo) < order(mid) and (hi is None or order(mid) < order(hi))
+    return mid if inside and mid.startswith(prefix) else None
 
 
 def get_cloud_schemes() -> list[str]:
@@ -141,6 +161,11 @@ class Client(ABC):
     CREDENTIAL_KEYS: ClassVar[frozenset[str]] = frozenset()
     LIST_PAGE_SIZE: ClassVar[int] = 1000
     PROBE_BOUNDED_SPLITS: ClassVar[bool] = True  # pays off with large pages
+
+    @staticmethod
+    def key_order(key: str) -> Any:
+        """The sort key of the order the server lists keys in."""
+        return key
 
     @classmethod
     def has_explicit_credentials(cls, client_config: dict | None) -> bool:
@@ -375,27 +400,25 @@ class Client(ABC):
         if processes and getattr(impl, "__func__", None) is Client._fetch_ranges:
             impl = functools.partial(impl, processes=True)
         result_queue: ResultQueue = asyncio.Queue(2 * LIST_WORKERS)
-        main_task = get_loop().create_task(impl(start_prefix, result_queue))
-        get: asyncio.Future | None = None
+
+        async def listing() -> None:
+            try:
+                await impl(start_prefix, result_queue)
+            except asyncio.CancelledError:
+                raise
+            except BaseException:
+                await result_queue.put(None)
+                raise
+            await result_queue.put(None)
+
+        main_task = get_loop().create_task(listing())
         try:
-            while not main_task.done():
-                get = asyncio.ensure_future(result_queue.get())
-                await asyncio.wait(
-                    [get, main_task], return_when=asyncio.FIRST_COMPLETED
-                )
-                if get.done():
-                    yield get.result() if rows else _as_files(get.result())
-                else:
-                    get.cancel()
-            while not result_queue.empty():
-                page = result_queue.get_nowait()
+            while (page := await result_queue.get()) is not None:
                 yield page if rows else _as_files(page)
             await main_task
         finally:
-            pending = [main_task] if get is None else [main_task, get]
-            for task in pending:
-                task.cancel()
-            await asyncio.gather(*pending, return_exceptions=True)
+            main_task.cancel()
+            await asyncio.gather(main_task, return_exceptions=True)
 
     async def _fetch_nested(self, start_prefix: str, result_queue: ResultQueue) -> None:
         progress_bar = tqdm(desc=f"Listing {self.uri}", unit=" objects", leave=False)
@@ -450,8 +473,9 @@ class Client(ABC):
         queue: asyncio.Queue[tuple[str, str | None, int]] = asyncio.Queue()
         queue.put_nowait(("", None, 0))
         alphabet: set[str] = set()
+        order = self.key_order
         open_ranges, found, seeks = 1, False, True
-        pool = Pool(self, PROCESSES) if processes else None
+        pool = Pool(self, prefix, PROCESSES) if processes else None
         in_flight = PROCESS_LIST_WORKERS if pool and pool.size else LIST_WORKERS
         probes: set[asyncio.Task] = set()
         pbar = tqdm(desc=f"Listing {self.uri}", unit=" objects", leave=False)
@@ -469,11 +493,17 @@ class Client(ABC):
             finally:
                 bound.probing = False
             hi = bound.hi
-            if bound.done or (bound.last or "") >= mid or not bound.keeps(mid):
+            if (
+                bound.done
+                or order(bound.last or "") >= order(mid)
+                or not bound.keeps(mid)
+            ):
                 open_ranges -= 1  # the range got there first
             elif key is None or not bound.keeps(key):
                 bound.shrink(mid)  # nothing past mid: no empty range to read
-                dense = key_midpoint(bound.last or "", mid, alphabet, bound.first)
+                dense = key_midpoint(
+                    bound.last or "", mid, alphabet, bound.first, order=order
+                )
                 if bound.first is not None and dense is not None:
                     queue.put_nowait((dense, mid, bound.pages))
                     bound.shrink(dense)
@@ -484,7 +514,7 @@ class Client(ABC):
                 bound.shrink(mid)
 
         async def read(lo: str, hi: str | None, age: int) -> None:
-            bound = Bound(hi)
+            bound = Bound(hi, order)
             bound.pages = age
             try:
                 await read_pages_of(lo, bound)
@@ -499,15 +529,15 @@ class Client(ABC):
                 async for files, first, last in pages:
                     bound.pages += 1
                     if last is not None:  # before the put: a probe may return meanwhile
-                        bound.last = max(bound.last or last, last)
+                        bound.last = max(bound.last or last, last, key=order)
                         bound.first = first
-                    if first is not None and first < lo:  # the server ignores the start
-                        seeks = False
+                    if first is not None and order(first) < order(lo):
+                        seeks = False  # the server ignores the start
                     if files:
                         await result_queue.put(files)
                         pbar.update(len(files))
-                    found = found or last is not None
-                    if last is None or last <= lo:
+                    found = found or first is not None
+                    if last is None or order(last) <= order(lo):
                         continue
                     alphabet.update(last)
                     if not bound.keeps(last):
@@ -526,11 +556,17 @@ class Client(ABC):
                 return
             young = bound.pages <= YOUNG_PAGES
             if young:
-                mid = key_midpoint(last, bound.hi, alphabet, first)
+                mid = key_midpoint(
+                    last, bound.hi, alphabet, first, SPLIT_PAGES, prefix, order
+                )
             elif bound.hi is None:
-                mid = key_midpoint(last, None, alphabet, first, bound.pages**2)
+                mid = key_midpoint(
+                    last, None, alphabet, first, bound.pages**2, prefix, order
+                )
             else:
-                mid = key_midpoint(last, bound.hi, alphabet)
+                mid = key_midpoint(
+                    last, bound.hi, alphabet, None, SPLIT_PAGES, prefix, order
+                )
             if mid is None:
                 return
             open_ranges += 1
@@ -628,10 +664,11 @@ class Client(ABC):
         def keep(key: str) -> bool:
             return self._is_valid_key(key) and bound.keeps(key)
 
+        lo_key = self.key_order(lo)
         async with aclosing(self._pages_after(prefix, lo, keep, hi=bound.hi)) as pages:
-            async for files, last in pages:
-                first = files[0].path if files else None
-                yield [f for f in files if lo < f.path], first, last
+            async for files, first, last in pages:
+                # GCS startOffset and Azure start_from include the start key
+                yield [f for f in files if self.key_order(f.path) > lo_key], first, last
 
     def _pages_after(
         self,
@@ -642,8 +679,9 @@ class Client(ABC):
         hi: str | None = None,
     ) -> AsyncGenerator[Page, None]:
         """Pages under ``prefix`` after ``start_after``, in key order; only keys to
-        ``keep`` become files. A backend that can end a listing at a key ends it
-        after ``hi``."""
+        ``keep`` become files. A delete marker is not an object, but it can be a
+        page's last key. A backend that can end a listing at a key ends it after
+        ``hi``."""
         raise NotImplementedError
 
     async def _probe(self, prefix: str, start_after: str) -> str | None:
@@ -651,7 +689,7 @@ class Client(ABC):
         ``None`` only when the listing ends there. Usually one request of one key."""
         pages = self._pages_after(prefix, start_after, lambda _: False, page_size=1)
         async with aclosing(pages):
-            async for _, last in pages:
+            async for _, _, last in pages:
                 if last is not None:  # a page may be empty and still not the last
                     return last
         return None

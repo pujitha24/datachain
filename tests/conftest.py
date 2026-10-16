@@ -491,6 +491,42 @@ class CloudTestCatalog:
         return Session("CTCSession", catalog=self.catalog)
 
 
+AZURITE_IMAGE = "mcr.microsoft.com/azure-storage/azurite:3.37.0"
+
+
+@pytest.fixture(scope="session")
+def azurite(docker_client, tmp_path_factory):
+    """pytest-servers' Azurite at a release that honors ``startFrom``."""
+    import requests
+    from docker.errors import NotFound
+    from filelock import FileLock
+    from pytest_servers.azure import AZURITE_CONNECTION_STRING, AZURITE_URL
+    from pytest_servers.utils import wait_until, wait_until_running
+
+    name = "datachain-azurite-" + AZURITE_IMAGE.rsplit(":", 1)[1]
+    with FileLock(tmp_path_factory.getbasetemp().parent / f"{name}.lock"):
+        try:
+            container = docker_client.containers.get(name)
+        except NotFound:
+            container = docker_client.containers.run(
+                AZURITE_IMAGE,
+                command="azurite-blob --loose --blobHost 0.0.0.0 --skipApiVersionCheck",
+                name=name,
+                detach=True,
+                remove=True,
+                ports={"10000/tcp": None},
+            )
+        wait_until_running(container)
+        port = container.ports.get("10000/tcp")[0]["HostPort"]
+
+    def is_healthy() -> bool:
+        r = requests.get(AZURITE_URL.format(port=port), timeout=3)
+        return r.status_code == 400 and "Azurite" in r.headers.get("Server", "")
+
+    wait_until(is_healthy, timeout=30)
+    return AZURITE_CONNECTION_STRING.format(port=port)
+
+
 cloud_types = ["s3", "gs", "azure"]
 
 

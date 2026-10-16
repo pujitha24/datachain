@@ -2,7 +2,13 @@ import botocore.session
 import pytest
 from botocore.utils import parse_timestamp
 
-from datachain.client.s3 import ClientS3, _handle_200_error, _parse_timestamp
+from datachain.client.s3 import (
+    _FIELDS,
+    ClientS3,
+    _fields,
+    _handle_200_error,
+    _parse_timestamp,
+)
 from datachain.client.writeconfig import WriteConfig
 from datachain.node import DirType, Node
 from datachain.nodes_thread_pool import NodeChunk
@@ -192,3 +198,15 @@ def test_200_error_check(operation, body, status):
 )
 def test_directory_buckets_list_out_of_key_order(bucket, in_order):
     assert ClientS3(bucket, {}, None)._lists_in_key_order() is in_order
+
+
+def test_listing_fields_are_kept_once_per_shape_name():
+    def shape():
+        model = botocore.session.get_session().get_service_model("s3")
+        return model.operation_model("ListObjectVersions").output_shape
+
+    _fields(shape())
+    kept = len(_FIELDS)
+    _fields(shape())
+
+    assert len(_FIELDS) == kept

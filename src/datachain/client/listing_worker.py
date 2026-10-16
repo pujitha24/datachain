@@ -24,9 +24,11 @@ RangePage = tuple[list[Any], str | None, str | None]
 
 
 class Bound:
-    """The upper end of a range ``(lo, hi]``; it only shrinks, by a split."""
+    """The upper end of a range ``(lo, hi]``; it only shrinks, by a split. Keys
+    compare in ``order``, the server's order."""
 
-    def __init__(self, hi: str | None) -> None:
+    def __init__(self, hi: str | None, order: "Callable[[str], Any]") -> None:
+        self.order = order
         self.hi = hi
         self.on_shrink: Callable[[str], None] | None = None
         self.last: str | None = None  # the last key read so far
@@ -35,13 +37,22 @@ class Bound:
         self.probing = False  # a split waits for its probe
         self.done = False
 
+    @property
+    def hi(self) -> str | None:
+        return self._hi
+
+    @hi.setter
+    def hi(self, hi: str | None) -> None:
+        self._hi = hi
+        self._hi_key = None if hi is None else self.order(hi)
+
     def shrink(self, hi: str) -> None:
         self.hi = hi
         if self.on_shrink:
             self.on_shrink(hi)
 
     def keeps(self, key: str) -> bool:
-        return self.hi is None or key <= self.hi
+        return self._hi_key is None or self.order(key) <= self._hi_key
 
 
 class ChildDied(Exception):  # noqa: N818
@@ -148,7 +159,7 @@ class Child:
 class Pool:
     """Child processes listing ranges for one ``Client._fetch_ranges`` call."""
 
-    def __init__(self, client: "Client", size: int = 0) -> None:
+    def __init__(self, client: "Client", prefix: str, size: int = 0) -> None:
         try:
             self.spec = dump(
                 (
@@ -157,6 +168,7 @@ class Pool:
                     client.fs_kwargs,
                     client.cache,
                     client.LIST_PAGE_SIZE,
+                    prefix,
                 )
             )
         except Exception:  # noqa: BLE001
@@ -234,7 +246,7 @@ class Pool:
             child.kill()
 
 
-async def _serve(client: "Client", inp: BinaryIO, out: BinaryIO) -> None:
+async def _serve(client: "Client", prefix: str, inp: BinaryIO, out: BinaryIO) -> None:
     loop = asyncio.get_running_loop()
     inbox: asyncio.Queue = asyncio.Queue()
 
@@ -272,7 +284,7 @@ async def _serve(client: "Client", inp: BinaryIO, out: BinaryIO) -> None:
 
     threading.Thread(target=pump, daemon=True).start()
     try:  # warm up DNS, TLS, credentials and the bucket region before taking work
-        await client._probe("", "")
+        await client._probe(prefix, "")
     except Exception:
         logger.debug("Listing process warm-up failed", exc_info=True)
     write("ready", None)
@@ -280,7 +292,7 @@ async def _serve(client: "Client", inp: BinaryIO, out: BinaryIO) -> None:
         kind, rid, *args = msg
         if kind == "open":
             prefix, lo, hi = args
-            bounds[rid] = Bound(hi)
+            bounds[rid] = Bound(hi, client.key_order)
             tasks[rid] = asyncio.create_task(run(rid, prefix, lo))
         elif kind == "hi" and rid in bounds:
             bounds[rid].hi = args[0]
@@ -295,10 +307,10 @@ def main() -> None:
 
     out = os.fdopen(os.dup(1), "wb")
     os.dup2(2, 1)  # stray prints must not corrupt the frames
-    cls, name, fs_kwargs, cache, page_size = load(sys.stdin.buffer)
+    cls, name, fs_kwargs, cache, page_size, prefix = load(sys.stdin.buffer)
     client = cls(name, fs_kwargs, cache)
     client.LIST_PAGE_SIZE = page_size
-    sync(get_loop(), _serve, client, sys.stdin.buffer, out)
+    sync(get_loop(), _serve, client, prefix, sys.stdin.buffer, out)
 
 
 if __name__ == "__main__":
