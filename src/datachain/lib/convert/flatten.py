@@ -1,6 +1,4 @@
 import functools
-import re
-from collections import namedtuple
 from collections.abc import Generator, Iterator
 from typing import Any, NamedTuple
 
@@ -8,8 +6,6 @@ from pydantic import BaseModel
 
 from datachain.lib.data_model import unwrap_optional
 from datachain.lib.model_store import ModelStore
-
-SENTINEL = "_type_tag"  # the column of an Optional[DataModel] node
 
 
 class FieldKind(NamedTuple):
@@ -72,75 +68,6 @@ def iter_flat_columns(
             yield from iter_flat_columns(kind.inner, path)
         else:
             yield FlatColumn(path, False)
-
-
-@functools.lru_cache(maxsize=1024)
-def row_type(model: type[BaseModel]) -> type[Any]:
-    """A ``NamedTuple`` of ``model``'s flat columns in DB order.
-
-    A UDF that declares ``model`` as its output may yield these rows instead of
-    ``model`` objects: they skip validation and flattening, and readers still get
-    ``model`` objects back. Nested fields are named ``parent__child``. List
-    defaults become tuples; fields with a default factory, or a default holding a
-    dict or a model, have no default.
-    """
-    names: list[str] = []
-    defaults: list[Any] = []
-    for name, kind in _field_kinds(model):
-        if kind.is_model:
-            cols = [] if not kind.is_optional else [f"{name}__{SENTINEL}"]
-            cols += [f"{name}__{c}" for c in row_type(kind.inner)._fields]
-        else:
-            cols = [name]
-        names += cols
-        field = model.model_fields[name]
-        values = None if field.is_required() else _row_defaults(field)
-        if values is None:
-            defaults.clear()
-        else:
-            defaults += values
-    typename = re.sub(r"\W", "_", model.__name__) + "Row"
-    base = namedtuple(typename, names, defaults=defaults)  # type: ignore[misc]  # noqa: PYI024
-    return type(
-        base.__name__,
-        (base,),
-        {
-            "__slots__": (),
-            "__dc_model__": model,
-            "__reduce__": lambda row: (_rebuild_row, (model, tuple(row))),
-        },
-    )
-
-
-def _row_defaults(field: Any) -> list[Any] | None:
-    """Flat defaults rows share, with lists as tuples; None when a row needs its own
-    value, for a default factory, a dict or a model."""
-    if field.default_factory is not None or isinstance(field.default, dict):
-        return None
-    values = flatten_value(field.default, field.annotation)
-    if any(_holds_mutable(v) for v in values):
-        return None
-    return [_frozen(v) for v in values]
-
-
-def _holds_mutable(value: Any) -> bool:
-    if isinstance(value, (dict, BaseModel)):
-        return True
-    return isinstance(value, (list, tuple, set)) and any(map(_holds_mutable, value))
-
-
-def _frozen(value: Any) -> Any:
-    if isinstance(value, (list, tuple, set)):
-        return tuple(map(_frozen, value))
-    return value
-
-
-def _rebuild_row(model: type[BaseModel], values: tuple) -> tuple:
-    return row_type(model)(*values)
-
-
-def row_model(obj: Any) -> type[BaseModel] | None:
-    return getattr(type(obj), "__dc_model__", None)
 
 
 def flatten(obj: BaseModel) -> tuple:

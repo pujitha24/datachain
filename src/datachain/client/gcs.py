@@ -12,8 +12,7 @@ from gcsfs import GCSFileSystem
 from gcsfs.retry import HttpError
 
 from datachain.client.fileslice import FileWrapper
-from datachain.lib.convert.flatten import row_type
-from datachain.lib.file import File
+from datachain.lib.file import File, FileRow
 
 from .fsspec import BucketStatus, Client, Page, iso_timestamp
 
@@ -24,9 +23,6 @@ if TYPE_CHECKING:
 GCSFileSystem.set_session = GCSFileSystem._set_session
 # Skip the GCE metadata check — it adds latency and hangs outside GCE.
 os.environ.setdefault("NO_GCE_CHECK", "true")
-
-
-FileRow = row_type(File)
 
 
 class GCSClient(Client):

@@ -2,7 +2,6 @@ from importlib.metadata import version
 
 from datachain import func, llm  # re-export submodule namespaces
 from datachain.client import BucketStatus, bucket_status
-from datachain.lib.convert.flatten import row_type
 from datachain.lib.data_model import DataModel, DataType, is_chain_type
 from datachain.lib.dc import (
     C,
@@ -111,5 +110,4 @@ __all__ = [
     "read_storage",
     "read_values",
     "read_zarr",
-    "row_type",
 ]

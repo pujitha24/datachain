@@ -565,7 +565,7 @@ class AbstractWarehouse(ABC, Serializable):
         buffer_size: int,
         flush_interval: float,
     ) -> "InsertBuffer":
-        """Get or create an InsertBuffer for the given table and columns."""
+        """Get or create the InsertBuffer of ``table``; buffers are kept per table."""
 
     def close_buffer(self, table: sa.Table) -> None:
         """Flush and close the buffer for the given table."""

@@ -69,7 +69,7 @@ def usable_cpus() -> int:
 
 PROCESSES = 0 if usable_cpus() < 2 else min(4, usable_cpus())
 FRAME = struct.Struct("<Q")
-# files, first key, last key; files are ``row_type(File)`` rows
+# files, first key, last key; files are ``FileRow`` rows
 RangePage = tuple[list[Any], str | None, str | None]
 
 
@@ -291,12 +291,11 @@ class Pool:
     async def pages(
         self, prefix: str, lo: str, bound: Bound
     ) -> AsyncGenerator[RangePage, None]:
-        from datachain.lib.convert.flatten import row_type
-        from datachain.lib.file import File
+        from datachain.lib.file import FileRow
 
         if not self.children:
             raise ChildDied
-        file_row = partial(tuple.__new__, row_type(File))
+        file_row = partial(tuple.__new__, FileRow)
         child = min(self.children, key=lambda c: len(c.ranges))
         rid = self.next_id = self.next_id + 1
         queue: asyncio.Queue = asyncio.Queue(2)
@@ -366,7 +365,7 @@ async def _serve(  # noqa: C901
         finally:
             tasks.pop(rid, None)
             bounds.pop(rid, None)
-        if error is not None:  # out of the handler: a copy takes no traceback
+        if error is not None:
             write("error", rid, picklable(error))
 
     threading.Thread(target=pump, daemon=True).start()

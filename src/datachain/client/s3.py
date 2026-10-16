@@ -13,8 +13,7 @@ from botocore.utils import parse_timestamp
 from fsspec.asyn import get_loop, sync, sync_wrapper
 from s3fs import S3FileSystem
 
-from datachain.lib.convert.flatten import row_type
-from datachain.lib.file import File
+from datachain.lib.file import File, FileRow
 
 from .fsspec import (
     DELIMITER,
@@ -151,9 +150,6 @@ class _S3FileSystem(S3FileSystem):
 
     _connect = set_session
     connect = sync_wrapper(set_session)
-
-
-FileRow = row_type(File)
 
 
 class ClientS3(Client):

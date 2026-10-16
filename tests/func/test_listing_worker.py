@@ -9,8 +9,8 @@ import datachain as dc
 from datachain.asyn import get_loop
 from datachain.client import Client
 from datachain.client.listing_worker import Child, Pool, item_path
-from datachain.lib.convert.flatten import flatten, row_type
-from datachain.lib.file import File
+from datachain.lib.convert.flatten import flatten
+from datachain.lib.file import File, FileRow
 from datachain.lib.listing import list_bucket
 
 TREE = {
@@ -208,7 +208,7 @@ def test_listing_rows_are_normalized_files(client, tree):
     rows = sync(get_loop(), _items, client, "", False)
 
     assert rows
-    assert all(type(r) is row_type(File) for r in rows)
+    assert all(type(r) is FileRow for r in rows)
     assert [flatten(File(**r._asdict())) for r in rows] == [tuple(r) for r in rows]
 
 

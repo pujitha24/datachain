@@ -236,3 +236,24 @@ def test_empty_rows_insert_defaults(sqlite_db):
 
     query = sa.select(table.c.value)
     assert list(warehouse.dataset_rows_select(query)) == [(None,), (None,)]
+
+
+def test_map_tuples_are_validated(sqlite_db):
+    from types import SimpleNamespace
+
+    from datachain.lib.signal_schema import SignalSchema
+    from datachain.lib.udf import UdfError
+    from datachain.query.dataset import process_udf_outputs
+    from datachain.sql.types import Int, String
+
+    warehouse = SQLiteWarehouse(sqlite_db)
+    table = warehouse.create_udf_table([sa.Column("a", Int), sa.Column("b", String)])
+    inner = SimpleNamespace(
+        output=SignalSchema({"a": int, "b": str}),
+        is_input_batched=False,
+        is_output_batched=False,
+    )
+    udf = SimpleNamespace(output={"a": Int, "b": String}, inner=inner)
+
+    with pytest.raises(UdfError):
+        process_udf_outputs(warehouse, table, iter([[(1, "x", None)]]), udf)

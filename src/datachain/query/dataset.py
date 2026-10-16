@@ -591,8 +591,8 @@ def process_udf_outputs(
     else:
         columns = [*udf.output, "sys__input_id", "sys__partial", "sys__empty"]
 
-    # types of values adjust_outputs keeps as they are, per column of a row in
-    # `columns` order; it only puts the column default in place of None
+    # types of values adjust_outputs keeps as they are, per column of a gen or agg
+    # row in `columns` order; it only puts the column default in place of None
     exact = _keeps_exact_types(type(warehouse))
     kept_types = [
         frozenset({type(None)})
@@ -630,7 +630,7 @@ def process_udf_outputs(
                 for row in udf_output:
                     cb.relative_update()
                     if type(row) is tuple:
-                        if kept_as_is(row):
+                        if udf_kind != "map" and kept_as_is(row):
                             yield with_defaults(row)
                             continue
                         row = dict(zip(columns, row, strict=True))

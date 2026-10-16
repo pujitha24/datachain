@@ -17,8 +17,7 @@ from azure.core.exceptions import (
 from azure.storage.blob import BlobServiceClient
 from fsspec.asyn import get_loop, sync
 
-from datachain.lib.convert.flatten import row_type
-from datachain.lib.file import File
+from datachain.lib.file import File, FileRow
 
 from .fsspec import BucketStatus, Client, Page, utf16_units
 
@@ -42,9 +41,6 @@ class _AzureWriteBuffer(SpooledTemporaryFile):
     """
 
     version_id: str | None = None
-
-
-FileRow = row_type(File)
 
 
 class AzureClient(Client):

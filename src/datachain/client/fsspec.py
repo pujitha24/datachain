@@ -46,15 +46,15 @@ logger = logging.getLogger("datachain")
 FETCH_WORKERS = 100
 LIST_WORKERS = 16
 PROCESS_LIST_WORKERS = 64  # in flight once child processes parse the pages
-SPLIT_PAGES = 4
-YOUNG_PAGES = 4  # splits stay SPLIT_PAGES ahead until a range and its parents read more
+SPLIT_PAGES = 4  # a young range splits at most this many pages ahead
+YOUNG_PAGES = 4  # a range is young until it and its parents read this many pages
 DELIMITER = "/"  # Path delimiter.
 
 DATA_SOURCE_URI_PATTERN = re.compile(r"^[\w]+:\/\/.*$")
 FRACTION = re.compile(r"(?<=\.)\d+")
 CLOUD_STORAGE_PROTOCOLS = {"s3", "gs", "az", "hf"}
 
-# pages of File objects or row_type(File) rows; None ends the listing
+# pages of File objects or FileRow rows; None ends the listing
 ResultQueue = asyncio.Queue[Sequence[Any] | None]
 # File rows, and the first object and the last key of any kind listed
 Page = tuple[list[Any], str | None, str | None]
@@ -391,7 +391,7 @@ class Client(ABC):
         rows: bool = False,
     ) -> AsyncIterator[Sequence[Any]]:
         """Pages of ``File`` objects; with ``rows``, a range listing yields
-        ``row_type(File)`` rows instead. With ``processes``, a range listing may
+        ``FileRow`` rows instead. With ``processes``, a range listing may
         parse pages in child processes."""
         try:
             impl = getattr(self, f"_fetch_{method}")
@@ -484,8 +484,7 @@ class Client(ABC):
         async def split(mid: str, bound: Bound) -> None:
             """Open ``(mid, hi]`` if a probe finds a key there. If not, the range
             ends at ``mid`` and splits where its keys are dense instead: keys
-            that cluster leave most midpoints empty. The range keeps reading
-            meanwhile."""
+            that cluster leave most midpoints empty."""
             nonlocal open_ranges
             try:
                 async with local:
@@ -706,7 +705,7 @@ class Client(ABC):
 
     async def _probe(self, prefix: str, start_after: str) -> str | None:
         """The first key after ``start_after``, of any kind, even a delete marker;
-        ``None`` only when the listing ends there. Usually one request of one key."""
+        ``None`` only when the listing ends there."""
         pages = self._pages_after(prefix, start_after, lambda _: False, page_size=1)
         async with aclosing(pages):
             async for _, _, last in pages:
