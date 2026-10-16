@@ -178,7 +178,9 @@ def test_children_stop_when_listing_is_closed_early(
 @pytest.mark.parametrize("cloud_type", ["s3"], indirect=True)
 @pytest.mark.parametrize("tree", [TREE], indirect=True)
 def test_config_that_does_not_pickle_lists_in_process(client, tree, remote_rows):
-    client.fs_kwargs = {**client.fs_kwargs, "hook": lambda: None}
+    from aiobotocore.session import AioSession
+
+    client.fs_kwargs = {**client.fs_kwargs, "session": AioSession()}
 
     assert Pool(client, "", 2).size == 0
     items = sync(get_loop(), _items, client, "", True)

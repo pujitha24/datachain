@@ -1,9 +1,8 @@
-import functools
 import os
 from collections.abc import AsyncGenerator, Callable
 from datetime import datetime
 from typing import TYPE_CHECKING, Any, cast
-from xml.etree.ElementTree import Element, fromstring, tostring
+from xml.etree.ElementTree import Element, ParseError, fromstring
 
 from aiobotocore.parsers import AioResponseParserFactory, AioRestXMLParser
 from aiobotocore.session import AioSession
@@ -11,7 +10,7 @@ from botocore import handlers
 from botocore.exceptions import NoCredentialsError
 from botocore.model import Shape
 from botocore.utils import parse_timestamp
-from fsspec.asyn import get_loop, sync
+from fsspec.asyn import get_loop, sync, sync_wrapper
 from s3fs import S3FileSystem
 
 from datachain.lib.convert.flatten import row_type
@@ -82,21 +81,29 @@ def _read(node: Element, fields: Fields) -> dict[str, Any]:
 
 class _ListingParser(AioRestXMLParser):
     """Reads object listing entries straight from the XML, skipping botocore's
-    model walk."""
+    model walk. A listing page that does not parse, or holds an error, is a 500
+    that botocore retries."""
 
-    async def parse(self, response, shape):
-        if (
-            response["status_code"] != 200
-            or getattr(shape, "name", "") not in _LISTINGS
-        ):
-            return await super().parse(response, shape)
+    def _do_parse(self, response, shape):
+        if getattr(shape, "name", "") not in _LISTINGS or not response["body"]:
+            return super()._do_parse(response, shape)
+        try:
+            root = fromstring(response["body"])  # noqa: S314
+        except ParseError:
+            root = None
+        if root is None or root.tag.removeprefix(_NS) == "Error":
+            response["status_code"] = 500
+            return self._do_error_parse(response, shape)
         fields = {t: f for t, f in _fields(shape).items() if f[2]}
-        root = fromstring(response["body"])  # noqa: S314
         entries = _read(root, fields)
         for node in [n for n in root if n.tag.removeprefix(_NS) in fields]:
             root.remove(node)
-        parsed = await super().parse({**response, "body": tostring(root)}, shape)
-        return parsed | entries
+        return super()._do_parse({**response, "body": root}, shape) | entries
+
+    def _initial_body_parse(self, xml_string):
+        if isinstance(xml_string, Element):
+            return xml_string
+        return super()._initial_body_parse(xml_string)
 
 
 class _ParserFactory(AioResponseParserFactory):
@@ -107,35 +114,42 @@ class _ParserFactory(AioResponseParserFactory):
 
 
 def _handle_200_error(operation_model, response_dict, **kwargs) -> None:
-    """botocore's check, but a listing body is not parsed twice: only its end tag."""
+    """botocore's 200-error check; a listing page is checked by its parser."""
     if getattr(operation_model, "name", "") not in _LISTING_OPS:
         handlers._handle_200_error(operation_model, response_dict, **kwargs)
-    elif (
-        response_dict
-        and response_dict["status_code"] == 200
-        and not response_dict["body"].rstrip().endswith(b"Result>")
-    ):
-        response_dict["status_code"] = 500
 
 
-@functools.cache
-def _session(profile: str | None) -> AioSession:
-    """One per profile, so fsspec reuses filesystem instances."""
-    session = AioSession(profile=profile)
-    factory = _ParserFactory()
-    factory.set_parser_defaults(timestamp_parser=_parse_timestamp)
-    session.register_component("response_parser_factory", factory)
-    # avoid parsing every listing page twice
-    session.unregister("before-parse.s3.*", handlers._handle_200_error)
-    session.register("before-parse.s3.*", _handle_200_error)
-    return session
+class _ListingSession(AioSession):
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        factory = _ParserFactory()
+        factory.set_parser_defaults(timestamp_parser=_parse_timestamp)
+        self.register_component("response_parser_factory", factory)
+        self.unregister("before-parse.s3.*", handlers._handle_200_error)
+        self.register("before-parse.s3.*", _handle_200_error)
+
+
+class _S3FileSystem(S3FileSystem):
+    """Every session it makes parses listings with ``_ListingParser``."""
+
+    _owns_session = False
+
+    async def set_session(self, refresh=False, kwargs={}):  # noqa: B006
+        if self.session is None or (refresh and self._owns_session):
+            self.session = _ListingSession(**self.kwargs)
+            self._owns_session = True
+        self._session_is_owned = False  # s3fs keeps the session, even on refresh
+        return await super().set_session(refresh, kwargs)
+
+    _connect = set_session
+    connect = sync_wrapper(set_session)
 
 
 FileRow = row_type(File)
 
 
 class ClientS3(Client):
-    FS_CLASS = S3FileSystem
+    FS_CLASS = _S3FileSystem
     PREFIX = "s3://"
     protocol = "s3"
     CREDENTIAL_KEYS = frozenset(
@@ -168,9 +182,6 @@ class ClientS3(Client):
 
         if "region_name" in kwargs:
             kwargs["config_kwargs"].setdefault("region_name", kwargs.pop("region_name"))
-
-        if "session" not in kwargs:
-            kwargs["session"] = _session(kwargs.pop("profile", None))
 
         # remove this `if` when https://github.com/fsspec/s3fs/pull/929 lands
         if not os.environ.get("AWS_REGION") and not os.environ.get("AWS_ENDPOINT_URL"):

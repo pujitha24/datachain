@@ -1,6 +1,13 @@
+import inspect
+import pickle
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
 import botocore.session
 import pytest
+from botocore.exceptions import ClientError
 from botocore.utils import parse_timestamp
+from fsspec.asyn import get_loop, sync
 
 from datachain.client.s3 import (
     _FIELDS,
@@ -165,23 +172,20 @@ def test_listing_parser_matches_botocore(operation):
     shape = (
         get_session().get_service_model("s3").operation_model(operation).output_shape
     )
-    response = {"status_code": 200, "headers": {}, "body": body}
-    expected = sync(get_loop(), AioRestXMLParser().parse, response, shape)
-    assert sync(get_loop(), _ListingParser().parse, response, shape) == expected
 
+    async def parse(parser):
+        response = {"status_code": 200, "headers": {}, "body": body}
+        parsed = parser.parse(response, shape)
+        return await parsed if inspect.isawaitable(parsed) else parsed
 
-LIST_BODY = (
-    b'<?xml version="1.0" encoding="UTF-8"?>\n<ListBucketResult><Name>b</Name>'
-    b"<Contents><Key>a</Key></Contents></ListBucketResult>\n"
-)
+    expected = sync(get_loop(), parse, AioRestXMLParser())
+    assert sync(get_loop(), parse, _ListingParser()) == expected
 
 
 @pytest.mark.parametrize(
     "operation,body,status",
     [
-        ("ListObjectsV2", LIST_BODY, 200),
-        ("ListObjectsV2", LIST_BODY[:-30], 500),  # truncated
-        ("ListObjectVersions", b"<Error><Code>InternalError</Code></Error>", 500),
+        ("ListObjectsV2", b"<Error><Code>InternalError</Code></Error>", 200),
         ("CompleteMultipartUpload", b"<Error><Code>InternalError</Code></Error>", 500),
         ("CompleteMultipartUpload", b"<CompleteMultipartUploadResult/>", 200),
     ],
@@ -210,3 +214,150 @@ def test_listing_fields_are_kept_once_per_shape_name():
     _fields(shape())
 
     assert len(_FIELDS) == kept
+
+
+PAGE = (
+    b'<?xml version="1.0" encoding="UTF-8"?>\n<ListBucketResult '
+    b'xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Name>b</Name>'
+    b"<KeyCount>1</KeyCount><MaxKeys>1000</MaxKeys><IsTruncated>false</IsTruncated>"
+    b"<Contents><Key>a</Key><LastModified>2026-09-30T23:00:00.000Z</LastModified>"
+    b"<ETag>&quot;e&quot;</ETag><Size>1</Size></Contents></ListBucketResult>"
+)
+ERROR_200 = b"<Error><Code>InternalError</Code><Message>retry</Message></Error>"
+MALFORMED = PAGE.replace(b"</Key>", b"</Kee>")
+TRUNCATED = PAGE[:-40]
+
+
+@pytest.fixture
+def s3_bodies(mocker):
+    """An S3 endpoint that answers every list request with the next body."""
+    bodies: list[bytes] = []
+    requests: list[str] = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            requests.append(self.path)
+            body = bodies.pop(0) if len(bodies) > 1 else bodies[0]
+            self.send_response(200)
+            self.send_header("Content-Type", "application/xml")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    mocker.patch("botocore.retryhandler.random.random", return_value=0.0)  # no backoff
+    fs = ClientS3.create_fs(
+        key="k",
+        secret="s",  # noqa: S106
+        client_kwargs={"endpoint_url": f"http://127.0.0.1:{server.server_port}"},
+        config_kwargs={"retries": {"mode": "legacy"}},
+        skip_instance_cache=True,
+    )
+
+    def listed(*answers: bytes):
+        bodies[:] = answers
+
+        async def keys():
+            await fs.set_session()
+            s3 = await fs.get_s3()
+            page = await s3.list_objects_v2(Bucket="b")
+            return [d["Key"] for d in page.get("Contents", [])]
+
+        return sync(get_loop(), keys), len(requests)
+
+    yield listed
+    server.shutdown()
+    server.server_close()
+
+
+@pytest.mark.parametrize(
+    "answers, keys, requests",
+    [
+        ([PAGE], ["a"], 1),
+        ([PAGE + b"<!-- trailing comment -->"], ["a"], 1),
+        ([b""], [], 1),
+        ([MALFORMED, PAGE], ["a"], 2),
+        ([TRUNCATED, PAGE], ["a"], 2),
+        ([ERROR_200, PAGE], ["a"], 2),
+    ],
+    ids=["valid", "comment", "empty", "malformed", "truncated", "error"],
+)
+def test_s3_listing_retries_only_a_bad_200(s3_bodies, answers, keys, requests):
+    assert s3_bodies(*answers) == (keys, requests)
+
+
+@pytest.mark.parametrize(
+    "body", [MALFORMED, TRUNCATED, ERROR_200], ids=["malformed", "truncated", "error"]
+)
+def test_s3_listing_gives_up_on_a_bad_200_at_the_retry_limit(s3_bodies, body):
+    with pytest.raises(ClientError) as e:
+        s3_bodies(body)
+    assert e.value.response["ResponseMetadata"]["HTTPStatusCode"] == 500
+
+
+def test_s3_filesystem_pickles():
+    fs = ClientS3.create_fs(
+        anon=True,
+        client_kwargs={"region_name": "us-east-1"},
+        skip_instance_cache=True,
+    )
+    fs.connect()
+
+    assert isinstance(pickle.loads(pickle.dumps(fs)), type(fs))  # noqa: S301
+
+
+def test_s3_sessions_parse_listings_and_take_new_credentials(monkeypatch):
+    from datachain.client.s3 import _ListingParser
+
+    def credentials(region):
+        fs = ClientS3.create_fs(client_kwargs={"region_name": region})
+        fs.connect()
+        parser = fs.s3._endpoint._response_parser_factory.create_parser("rest-xml")
+        return fs.s3._request_signer._credentials.access_key, parser
+
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "KEY_A")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "secret")
+    first, parser = credentials("us-east-1")
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "KEY_B")
+    second, _ = credentials("us-west-2")
+
+    assert (first, second) == ("KEY_A", "KEY_B")
+    assert isinstance(parser, _ListingParser)
+
+
+@pytest.mark.parametrize("refresh", ["explicit", "closed_http_sessions"])
+def test_s3_sessions_keep_the_listing_parser_on_refresh(refresh):
+    fs = ClientS3.create_fs(
+        anon=True,
+        client_kwargs={"region_name": "us-east-1"},
+        skip_instance_cache=True,
+    )
+    fs.connect()
+    if refresh == "explicit":
+        fs.connect(refresh=True)
+    else:
+        sync(get_loop(), fs.s3._endpoint.http_session.close)
+        fs.connect()
+
+    factory = fs.s3._endpoint._response_parser_factory
+    assert type(factory).__name__ == "_ParserFactory"
+
+
+def test_s3_injected_session_refreshes():
+    from aiobotocore.session import AioSession
+
+    session = AioSession()
+    fs = ClientS3.create_fs(
+        anon=True,
+        session=session,
+        client_kwargs={"region_name": "us-east-1"},
+        skip_instance_cache=True,
+    )
+    fs.connect()
+    fs.connect(refresh=True)
+
+    assert fs.session is session
