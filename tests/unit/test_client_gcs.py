@@ -235,3 +235,33 @@ def test_parse_timestamp_matches_isoparse(value):
     parsed = GCSClient.parse_timestamp(value)
     assert parsed == isoparse(value)
     assert isinstance(parsed.tzinfo, timezone)
+
+
+class _Recording(dict):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.read = set()
+
+    def __getitem__(self, key):
+        self.read.add(key)
+        return super().__getitem__(key)
+
+    def get(self, key, default=None):
+        self.read.add(key)
+        return super().get(key, default)
+
+
+@pytest.mark.parametrize("version_aware", [False, True])
+def test_listing_asks_for_every_field_it_reads(version_aware):
+    client = _make_client()
+    client._fs.version_aware = version_aware
+    item = _Recording(
+        name="a", size="1", generation="7", etag="e", updated="2026-10-01T00:00:00Z"
+    )
+    client._fs._call = AsyncMock(return_value={"items": [item]})
+
+    sync(get_loop(), client._list_page, "", "", None, lambda _: True)
+
+    fields = client._fs._call.call_args.kwargs["fields"]
+    assert fields == f"items({','.join(GCSClient.LIST_FIELDS)}),nextPageToken"
+    assert item.read <= set(GCSClient.LIST_FIELDS)

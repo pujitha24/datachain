@@ -2,7 +2,7 @@ import json
 import os
 from collections.abc import Callable
 from datetime import datetime
-from typing import TYPE_CHECKING, Any, BinaryIO, cast
+from typing import TYPE_CHECKING, Any, BinaryIO, ClassVar, cast
 from urllib.parse import quote
 
 from dateutil.parser import isoparse
@@ -31,6 +31,15 @@ class GCSClient(Client):
     protocol = "gs"
     CREDENTIAL_KEYS = frozenset({"token"})
     LIST_PAGE_SIZE = 5000
+    # the object fields a listing asks for: GCS sends every field otherwise
+    LIST_FIELDS: ClassVar[tuple[str, ...]] = (
+        "name",
+        "size",
+        "generation",
+        "etag",
+        "timeDeleted",
+        "updated",
+    )
 
     @classmethod
     def create_fs(cls, **kwargs) -> GCSFileSystem:
@@ -239,6 +248,7 @@ class GCSClient(Client):
             endOffset=None if hi is None else f"{hi}\0",  # exclusive
             maxResults=page_size or self.LIST_PAGE_SIZE,
             pageToken=token,
+            fields=f"items({','.join(self.LIST_FIELDS)}),nextPageToken",
             json_out=True,
             versions="true" if self._is_version_aware() else "false",
         )
