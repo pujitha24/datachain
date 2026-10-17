@@ -49,7 +49,6 @@ YOUNG_PAGES = 4  # a range is young until it and its parents read this many page
 DELIMITER = "/"  # Path delimiter.
 
 DATA_SOURCE_URI_PATTERN = re.compile(r"^[\w]+:\/\/.*$")
-FRACTION = re.compile(r"(?<=\.)\d+")
 CLOUD_STORAGE_PROTOCOLS = {"s3", "gs", "az", "hf"}
 
 # pages of File objects or FileRow rows; None ends the listing
@@ -116,13 +115,8 @@ def _as_files(page: Sequence[Any]) -> Sequence[Any]:
 
 def iso_timestamp(value: str) -> datetime | None:
     """ISO 8601 timestamp, parsed without dateutil."""
-    value = value.replace("Z", "+00:00")
     with suppress(ValueError):
         return datetime.fromisoformat(value)
-    with suppress(ValueError):  # Python 3.10 takes only 3 or 6 fraction digits
-        return datetime.fromisoformat(
-            FRACTION.sub(lambda m: m[0][:6].ljust(6, "0"), value, 1)
-        )
     return None
 
 

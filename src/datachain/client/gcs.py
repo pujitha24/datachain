@@ -227,7 +227,7 @@ class GCSClient(Client):
         assert dt.tzinfo is not None
         return dt
 
-    _fetch_default = _fetch_flat = Client._fetch_ranges
+    _fetch_default = Client._fetch_ranges
 
     async def _list_page(
         self,

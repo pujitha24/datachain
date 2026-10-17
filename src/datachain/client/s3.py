@@ -289,7 +289,7 @@ class ClientS3(Client):
 
         return self.fs.sign(self.get_uri(path), expiration=expires, **kwargs)
 
-    _fetch_default = _fetch_flat = Client._fetch_ranges
+    _fetch_default = Client._fetch_ranges
 
     def _lists_in_key_order(self) -> bool:
         # directory buckets neither sort keys nor take StartAfter

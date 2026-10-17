@@ -255,7 +255,7 @@ class AzureClient(Client):
             lpath = f"{lpath}?versionid={version_id}"
         await self.fs._get_file(lpath, rpath, callback=callback)
 
-    _fetch_default = _fetch_flat = Client._fetch_ranges
+    _fetch_default = Client._fetch_ranges
     _hns = False
 
     @staticmethod
