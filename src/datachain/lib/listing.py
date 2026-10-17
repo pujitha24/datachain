@@ -95,7 +95,7 @@ def list_bucket(uri: str, cache, client_config=None) -> Callable:
         config = client_config or {}
         client = Client.get_client(uri, cache, **config)  # type: ignore[arg-type]
         _, path = Client.parse_url(uri)
-        pages = client.scandir(path.rstrip("/"), processes=True, rows=True)
+        pages = client.scandir(path.rstrip("/"), processes=True)
         for entries in iter_over_async(pages, get_loop()):
             yield from entries
 

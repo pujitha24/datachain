@@ -75,7 +75,7 @@ def starting(pools):
 
 async def _items(client, prefix, processes):
     items = []
-    pages = client.scandir(prefix, processes=processes, rows=True)
+    pages = client.scandir(prefix, processes=processes)
     async with aclosing(pages) as pages:
         async for page in pages:
             items.extend(page)

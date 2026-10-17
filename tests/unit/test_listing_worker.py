@@ -201,9 +201,7 @@ def test_ranges_that_split_while_pages_are_in_flight_are_exact(seed, mocker):
 
 def _listed(client: Client, processes: bool = True) -> list[list]:
     async def pages():
-        return [
-            page async for page in client.scandir("", processes=processes, rows=True)
-        ]
+        return [page async for page in client.scandir("", processes=processes)]
 
     return sync(get_loop(), pages)
 

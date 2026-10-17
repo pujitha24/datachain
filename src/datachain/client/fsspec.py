@@ -57,14 +57,6 @@ def is_cloud_uri(uri: str) -> bool:
     return protocol in CLOUD_STORAGE_PROTOCOLS
 
 
-def _as_files(page: Sequence[Any]) -> Sequence[Any]:
-    if not page or not isinstance(page[0], tuple):
-        return page
-    from datachain.lib.file import File
-
-    return [File(**row._asdict()) for row in page]
-
-
 def iso_timestamp(value: str) -> datetime | None:
     """ISO 8601 timestamp, parsed without dateutil."""
     with suppress(ValueError):
@@ -319,11 +311,10 @@ class Client(ABC):
         start_prefix: str,
         method: str = "default",
         processes: bool = False,
-        rows: bool = False,
     ) -> AsyncIterator[Sequence[Any]]:
-        """Pages of ``File`` objects; with ``rows``, a range listing yields
-        ``FileRow`` rows instead. With ``processes``, a range listing may
-        parse pages in child processes."""
+        """Pages of entries: ``FileRow`` rows from a range listing, ``File``
+        objects otherwise. With ``processes``, a range listing may parse pages in
+        child processes."""
         try:
             impl = getattr(self, f"_fetch_{method}")
         except AttributeError:
@@ -348,7 +339,7 @@ class Client(ABC):
         main_task = get_loop().create_task(listing())
         try:
             while (page := await result_queue.get()) is not None:
-                yield page if rows else _as_files(page)
+                yield page
             await main_task
         finally:
             main_task.cancel()
