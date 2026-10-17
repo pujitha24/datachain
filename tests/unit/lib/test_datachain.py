@@ -6498,7 +6498,7 @@ def test_save_keeps_order_across_batches(test_session, monkeypatch, build, size)
 
 
 def test_adjust_outputs_calls_an_overridden_convert_type():
-    from datachain.query.dataset import adjust_outputs
+    from datachain.query.dataset import ColType, _keeps_exact_types, adjust_outputs
     from datachain.sql.types import DateTime
 
     class Normalizing:
@@ -6506,7 +6506,8 @@ def test_adjust_outputs_calls_an_overridden_convert_type():
             return val.astimezone(dt.UTC).replace(tzinfo=None)
 
     when = dt.datetime(2026, 1, 1, 12, tzinfo=dt.timezone(dt.timedelta(hours=2)))
-    col_types = [("x", DateTime(), dt.datetime, "DateTime", None)]
+    kept = _keeps_exact_types(Normalizing)  # type: ignore[arg-type]
+    col_types = [ColType("x", DateTime(), dt.datetime, "DateTime", None, kept)]
 
     row = adjust_outputs(Normalizing(), {"x": when}, col_types, None)  # type: ignore[arg-type]
 
