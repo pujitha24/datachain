@@ -12,7 +12,8 @@ from functools import partial
 from typing import TYPE_CHECKING, Any, BinaryIO
 
 if TYPE_CHECKING:
-    from datachain.client.fsspec import Client, Page
+    from datachain.client.fsspec import RangeListedClient
+    from datachain.client.ranges import Page
 
 logger = logging.getLogger("datachain")
 
@@ -64,7 +65,7 @@ def usable_cpus() -> int:
     return max(cpus, 1)
 
 
-PROCESSES = 0 if usable_cpus() < 2 else min(4, usable_cpus())
+LIST_PROCESSES = 0 if usable_cpus() < 2 else min(4, usable_cpus())
 FRAME = struct.Struct("<Q")
 
 
@@ -183,7 +184,7 @@ class Child:
 class Pool:
     """Child processes fetching pages for one ``Client._fetch_ranges`` call."""
 
-    def __init__(self, client: "Client", prefix: str, size: int = 0) -> None:
+    def __init__(self, client: "RangeListedClient", prefix: str, size: int = 0) -> None:
         try:
             self.spec = dump(
                 (
@@ -249,7 +250,7 @@ class Pool:
         ``ChildDied`` when the child is gone before it replies."""
         from datachain.lib.file import FileRow
 
-        from .fsspec import Page
+        from .ranges import Page
 
         live = [c for c in self.children if not c.died.is_set()]
         if not live:
@@ -271,7 +272,9 @@ class Pool:
             child.kill()
 
 
-async def _serve(client: "Client", prefix: str, inp: BinaryIO, out: BinaryIO) -> None:
+async def _serve(
+    client: "RangeListedClient", prefix: str, inp: BinaryIO, out: BinaryIO
+) -> None:
     loop = asyncio.get_running_loop()
     inbox: asyncio.Queue = asyncio.Queue()
 

@@ -96,7 +96,7 @@ RANGE_TREES = {
 @pytest.mark.parametrize("prefix", ["", "big"])
 def test_scandir_ranges_are_exact(client, tree, prefix, mocker):
     mocker.patch.object(type(client), "LIST_PAGE_SIZE", 4)
-    mocker.patch("datachain.client.fsspec.LIST_WORKERS", 3)
+    mocker.patch("datachain.client.ranges.LIST_WORKERS", 3)
     ranges = mocker.spy(client, "_list_page")
     expected = [p for p in _paths(tree) if p.startswith(prefix)]
     if not expected:
@@ -120,8 +120,8 @@ def test_scandir_old_ranges_split_far_after_a_probe(
     # with idle workers every range splits on its first pages; a range split off
     # another inherits its age, so the listing still turns to far splits
     mocker.patch.object(type(client), "LIST_PAGE_SIZE", 4)
-    mocker.patch("datachain.client.fsspec.LIST_WORKERS", workers)
-    mocker.patch("datachain.client.fsspec.YOUNG_PAGES", young_pages)
+    mocker.patch("datachain.client.ranges.LIST_WORKERS", workers)
+    mocker.patch("datachain.client.ranges.YOUNG_PAGES", young_pages)
     calls = mocker.spy(client, "_list_page")
 
     assert sorted(e.path for e in scandir(client, "")) == sorted(tree)
@@ -136,7 +136,7 @@ def test_scandir_old_ranges_split_far_after_a_probe(
 @pytest.mark.parametrize("tree", [{f"{i:03}": "x" for i in range(200)}], indirect=True)
 def test_scandir_split_past_the_data_opens_no_range(client, tree, mocker):
     mocker.patch.object(type(client), "LIST_PAGE_SIZE", 4)
-    mocker.patch("datachain.client.fsspec.LIST_WORKERS", 2)
+    mocker.patch("datachain.client.ranges.LIST_WORKERS", 2)
     calls = mocker.spy(client, "_list_page")
 
     assert sorted(e.path for e in scandir(client, "")) == sorted(tree)
@@ -156,7 +156,7 @@ def test_scandir_split_past_the_data_opens_no_range(client, tree, mocker):
 def test_scandir_is_exact_when_the_reader_is_slow(client, tree, processes, mocker):
     # pages wait for room in the result queue while split probes come back
     mocker.patch.object(type(client), "LIST_PAGE_SIZE", 4)
-    mocker.patch("datachain.client.fsspec.LIST_WORKERS", 4)
+    mocker.patch("datachain.client.ranges.LIST_WORKERS", 4)
 
     async def slow_reader():
         paths = []
@@ -237,7 +237,7 @@ def test_scandir_ranges_see_past_unlisted_keys(client, tree, mocker):
     for i in range(60):
         client.fs.pipe_file(f"{client.uri}/m//{i:02}", b"x")
     mocker.patch.object(type(client), "LIST_PAGE_SIZE", 4)
-    mocker.patch("datachain.client.fsspec.LIST_WORKERS", 3)
+    mocker.patch("datachain.client.ranges.LIST_WORKERS", 3)
     calls = mocker.spy(client, "_list_page")
 
     expected = sorted(_paths(tree))
@@ -249,7 +249,7 @@ def test_scandir_ranges_see_past_unlisted_keys(client, tree, mocker):
 @pytest.mark.parametrize("tree", [RANGE_TREES["flat"]], indirect=True)
 def test_scandir_builds_no_files_past_range_ends(client, tree, mocker):
     mocker.patch.object(type(client), "LIST_PAGE_SIZE", 4)
-    mocker.patch("datachain.client.fsspec.LIST_WORKERS", 3)
+    mocker.patch("datachain.client.ranges.LIST_WORKERS", 3)
     ranges = files = 0
     list_page = type(client)._list_page
 
@@ -367,7 +367,7 @@ def test_scandir_lists_keys_past_the_basic_multilingual_plane(
     client, tree, processes, mocker
 ):
     mocker.patch.object(type(client), "LIST_PAGE_SIZE", 4)
-    mocker.patch("datachain.client.fsspec.LIST_WORKERS", 4)
+    mocker.patch("datachain.client.ranges.LIST_WORKERS", 4)
 
     async def listed():
         paths = []

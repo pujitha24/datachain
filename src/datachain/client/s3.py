@@ -17,13 +17,12 @@ from datachain.lib.file import File, FileRow
 
 from .fsspec import (
     DELIMITER,
-    PROCESS_LIST_WORKERS,
     BucketStatus,
-    Client,
-    Page,
+    RangeListedClient,
     ResultQueue,
     iso_timestamp,
 )
+from .ranges import PROCESS_LIST_WORKERS, Page
 
 if TYPE_CHECKING:
     from datachain.client.writeconfig import WriteConfig
@@ -152,7 +151,7 @@ class _S3FileSystem(S3FileSystem):
     connect = sync_wrapper(set_session)
 
 
-class ClientS3(Client):
+class ClientS3(RangeListedClient):
     FS_CLASS = _S3FileSystem
     PREFIX = "s3://"
     protocol = "s3"
@@ -289,8 +288,6 @@ class ClientS3(Client):
 
         return self.fs.sign(self.get_uri(path), expiration=expires, **kwargs)
 
-    _fetch_default = Client._fetch_ranges
-
     def _lists_in_key_order(self) -> bool:
         # directory buckets neither sort keys nor take StartAfter
         return not self.name.endswith("--x-s3")
@@ -335,13 +332,13 @@ class ClientS3(Client):
         else:
             token = page["NextContinuationToken"]
         return Page(
-            [self._row_from_boto(d, versions) for d in entries if keep(d["Key"])],
+            [self._file_row(d, versions) for d in entries if keep(d["Key"])],
             entries[0]["Key"] if entries else None,
             max(keys, default=None),
             token,
         )
 
-    def _row_from_boto(self, v, versions: bool) -> tuple:
+    def _file_row(self, v, versions: bool) -> tuple:
         return FileRow(
             self.uri,
             v["Key"],

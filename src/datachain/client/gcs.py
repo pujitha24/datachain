@@ -14,7 +14,8 @@ from gcsfs.retry import HttpError
 from datachain.client.fileslice import FileWrapper
 from datachain.lib.file import File, FileRow
 
-from .fsspec import BucketStatus, Client, Page, iso_timestamp
+from .fsspec import BucketStatus, RangeListedClient, iso_timestamp
+from .ranges import Page
 
 if TYPE_CHECKING:
     from datachain.client.writeconfig import WriteConfig
@@ -25,7 +26,7 @@ GCSFileSystem.set_session = GCSFileSystem._set_session
 os.environ.setdefault("NO_GCE_CHECK", "true")
 
 
-class GCSClient(Client):
+class GCSClient(RangeListedClient):
     FS_CLASS = GCSFileSystem
     PREFIX = "gs://"
     protocol = "gs"
@@ -227,8 +228,6 @@ class GCSClient(Client):
         assert dt.tzinfo is not None
         return dt
 
-    _fetch_default = Client._fetch_ranges
-
     async def _list_page(
         self,
         prefix: str,
@@ -254,13 +253,13 @@ class GCSClient(Client):
         )
         items = page.get("items", [])
         return Page(
-            [self._row(d) for d in items if keep(d["name"])],
+            [self._file_row(d) for d in items if keep(d["name"])],
             items[0]["name"] if items else None,
             items[-1]["name"] if items else None,
             page.get("nextPageToken"),
         )
 
-    def _row(self, d: dict[str, Any]) -> tuple:
+    def _file_row(self, d: dict[str, Any]) -> tuple:
         return FileRow(
             self.uri,
             d["name"],

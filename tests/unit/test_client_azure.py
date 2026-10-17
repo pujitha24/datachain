@@ -274,7 +274,7 @@ def test_blob_name_is_decoded():
         "<Etag>0x8DC</Etag><Content-Length>7</Content-Length></Properties></Blob>"
     )
     assert client._blob_name(blob) == "a\x01b"
-    assert client._xml_to_row(blob, "a\x01b") == FileRow(
+    assert client._file_row(blob, "a\x01b") == FileRow(
         source="az://container",
         path="a\x01b",
         etag="0x8DC",

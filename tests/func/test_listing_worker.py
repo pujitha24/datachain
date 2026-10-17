@@ -28,7 +28,7 @@ def client(cloud_server, cloud_server_credentials, mocker):
         uri, cache=None, **cloud_server.client_config
     )
     mocker.patch.object(type(client), "LIST_PAGE_SIZE", 4)
-    mocker.patch("datachain.client.listing_worker.PROCESSES", 2)
+    mocker.patch("datachain.client.listing_worker.LIST_PROCESSES", 2)
     return client
 
 
@@ -161,7 +161,7 @@ def test_a_child_killed_inside_one_keys_versions_loses_none(
 @pytest.mark.parametrize("tree", [TREE], indirect=True)
 @pytest.mark.parametrize("processes", [1, 2])
 def test_ranges_of_a_dead_child_move_on(client, tree, processes, children, mocker):
-    mocker.patch("datachain.client.listing_worker.PROCESSES", processes)
+    mocker.patch("datachain.client.listing_worker.LIST_PROCESSES", processes)
     killed = []
     read = Child.read
 
@@ -300,7 +300,7 @@ def requests_in_flight(client, mocker):
 def test_parent_lists_with_its_own_budget_when_no_child_runs(
     client, tree, requests_in_flight, mocker, caplog
 ):
-    mocker.patch("datachain.client.fsspec.LIST_WORKERS", 3)
+    mocker.patch("datachain.client.ranges.LIST_WORKERS", 3)
     mocker.patch.object(Child, "start", side_effect=OSError("no process"))
 
     with caplog.at_level("WARNING", logger="datachain"):

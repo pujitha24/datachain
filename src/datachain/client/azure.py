@@ -19,7 +19,8 @@ from fsspec.asyn import get_loop, sync
 
 from datachain.lib.file import File, FileRow
 
-from .fsspec import BucketStatus, Client, Page, utf16_units
+from .fsspec import BucketStatus, RangeListedClient
+from .ranges import Page, utf16_units
 
 if TYPE_CHECKING:
     from datachain.client.writeconfig import WriteConfig
@@ -43,7 +44,7 @@ class _AzureWriteBuffer(SpooledTemporaryFile):
     version_id: str | None = None
 
 
-class AzureClient(Client):
+class AzureClient(RangeListedClient):
     FS_CLASS = AzureBlobFileSystem
     PREFIX = "az://"
     protocol = "az"
@@ -255,7 +256,6 @@ class AzureClient(Client):
             lpath = f"{lpath}?versionid={version_id}"
         await self.fs._get_file(lpath, rpath, callback=callback)
 
-    _fetch_default = Client._fetch_ranges
     _hns = False
 
     @staticmethod
@@ -298,7 +298,7 @@ class AzureClient(Client):
         names = [self._blob_name(b) for b in blobs]
         return Page(
             [
-                self._xml_to_row(b, n)
+                self._file_row(b, n)
                 for b, n in zip(blobs, names, strict=True)
                 if keep(n) and not self._is_directory(b)
             ],
@@ -318,7 +318,7 @@ class AzureClient(Client):
         text = name.text or ""
         return unquote(text) if name.get("Encoded") == "true" else text
 
-    def _xml_to_row(self, blob: Element, name: str) -> tuple:
+    def _file_row(self, blob: Element, name: str) -> tuple:
         props = blob.find("Properties")
         assert props is not None
         version = blob.findtext("VersionId") if self._is_version_aware() else None

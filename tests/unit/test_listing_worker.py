@@ -12,7 +12,7 @@ from fsspec.asyn import get_loop, sync
 
 import datachain
 from datachain.client import listing_worker
-from datachain.client.fsspec import Client, Page
+from datachain.client.fsspec import Client, RangeListedClient
 from datachain.client.listing_worker import (
     Child,
     ChildDied,
@@ -24,6 +24,7 @@ from datachain.client.listing_worker import (
     picklable,
     usable_cpus,
 )
+from datachain.client.ranges import Page
 from datachain.lib.file import FileRow
 
 ROOT = os.path.dirname(os.path.dirname(datachain.__file__))
@@ -110,13 +111,12 @@ def test_azure_errors_cross_the_pipe():
     assert "request failed" in str(sent)
 
 
-class VersionsClient(Client):
+class VersionsClient(RangeListedClient):
     """One key with many versions, then one more key, in pages of 4."""
 
     PREFIX = "fake://"
     protocol = "fake"
     LIST_PAGE_SIZE = 4
-    _fetch_default = Client._fetch_ranges
 
     def __init__(self, versions: int) -> None:
         super().__init__("bucket", {}, None)  # type: ignore[arg-type]
@@ -145,13 +145,12 @@ class VersionsClient(Client):
         )
 
 
-class SlowClient(Client):
+class SlowClient(RangeListedClient):
     """Keys with a few versions each; every request takes a random while."""
 
     PREFIX = "fake://"
     protocol = "fake"
     LIST_PAGE_SIZE = 4
-    _fetch_default = Client._fetch_ranges
 
     def __init__(self, seed: int) -> None:
         super().__init__("bucket", {}, None)  # type: ignore[arg-type]
@@ -190,8 +189,8 @@ class SlowClient(Client):
 
 @pytest.mark.parametrize("seed", range(40))
 def test_ranges_that_split_while_pages_are_in_flight_are_exact(seed, mocker):
-    mocker.patch("datachain.client.fsspec.LIST_WORKERS", 8)
-    mocker.patch("datachain.client.fsspec.YOUNG_PAGES", 1)
+    mocker.patch("datachain.client.ranges.LIST_WORKERS", 8)
+    mocker.patch("datachain.client.ranges.YOUNG_PAGES", 1)
     client = SlowClient(seed)
 
     pages = _listed(client, processes=False)
@@ -395,7 +394,7 @@ def test_usable_cpus_follow_the_cgroup_quotas(quotas, expected, monkeypatch):
 
 
 def test_s3_connections_cover_the_listing_requests_in_flight():
-    from datachain.client.fsspec import PROCESS_LIST_WORKERS
+    from datachain.client.ranges import PROCESS_LIST_WORKERS
     from datachain.client.s3 import ClientS3
 
     fs = ClientS3.create_fs(anon=True, skip_instance_cache=True)

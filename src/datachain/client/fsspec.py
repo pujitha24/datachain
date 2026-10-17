@@ -11,7 +11,6 @@ from abc import ABC, abstractmethod
 from collections.abc import (
     AsyncIterator,
     Callable,
-    Iterable,
     Iterator,
     Sequence,
 )
@@ -31,6 +30,8 @@ from datachain.nodes_fetcher import NodesFetcher
 from datachain.nodes_thread_pool import NodeChunk
 from datachain.progress import tqdm
 
+from .ranges import LIST_WORKERS, Page, RangeListing
+
 if TYPE_CHECKING:
     from fsspec.spec import AbstractFileSystem
 
@@ -42,10 +43,6 @@ if TYPE_CHECKING:
 logger = logging.getLogger("datachain")
 
 FETCH_WORKERS = 100
-LIST_WORKERS = 16
-PROCESS_LIST_WORKERS = 64  # in flight once child processes parse the pages
-SPLIT_PAGES = 4  # a young range splits at most this many pages ahead
-YOUNG_PAGES = 4  # a range is young until it and its parents read this many pages
 DELIMITER = "/"  # Path delimiter.
 
 DATA_SOURCE_URI_PATTERN = re.compile(r"^[\w]+:\/\/.*$")
@@ -53,51 +50,6 @@ CLOUD_STORAGE_PROTOCOLS = {"s3", "gs", "az", "hf"}
 
 # pages of File objects or FileRow rows; None ends the listing
 ResultQueue = asyncio.Queue[Sequence[Any] | None]
-
-
-class Page(NamedTuple):
-    """One listing request's reply."""
-
-    rows: list[Any]  # FileRow rows of the keys kept
-    first: str | None  # the first object's key
-    last: str | None  # the last key of any kind, delete markers included
-    token: Any  # resumes after this page; None on the last page
-
-
-class Bound:
-    """The read state of a range ``(lo, hi]``. Keys compare in ``order``, the
-    server's order. The fuzz tests check these rules:
-
-    - the ranges cover the listing without overlap;
-    - ``hi`` only shrinks;
-    - a finished range never splits;
-    - a range records how far it read before it waits on the result queue;
-    - a token advances only after its page is accepted.
-    """
-
-    def __init__(self, hi: str | None, order: Callable[[str], Any]) -> None:
-        self.order = order
-        self.hi = hi
-        self.last: str | None = None  # the last key read so far
-        self.first: str | None = None  # the first key of the last page
-        self.pages = 0  # read by this range and the ranges it split off from
-        self.probing = False  # a split waits for its probe
-        self.done = False
-
-    @property
-    def hi(self) -> str | None:
-        return self._hi
-
-    @hi.setter
-    def hi(self, hi: str | None) -> None:
-        self._hi = hi
-        self._hi_key = None if hi is None else self.order(hi)
-
-    def shrink(self, hi: str) -> None:
-        self.hi = hi
-
-    def keeps(self, key: str) -> bool:
-        return self._hi_key is None or self.order(key) <= self._hi_key
 
 
 def is_cloud_uri(uri: str) -> bool:
@@ -118,56 +70,6 @@ def iso_timestamp(value: str) -> datetime | None:
     with suppress(ValueError):
         return datetime.fromisoformat(value)
     return None
-
-
-def code_points(key: str) -> str:
-    return key
-
-
-def utf16_units(key: str) -> bytes:
-    return key.encode("utf-16-be", "surrogatepass")
-
-
-def key_midpoint(
-    lo: str,
-    hi: str | None,
-    alphabet: Iterable[str],
-    first: str | None = None,
-    pages: int = SPLIT_PAGES,
-    prefix: str = "",
-    order: Callable[[str], Any] = code_points,
-) -> str | None:
-    """Shortest key strictly between ``lo`` and ``hi`` in ``order`` (``None`` is
-    the end of ``prefix``); with ``first``, at most ``pages`` pages of
-    ``first..lo`` past ``lo``."""
-    chars = sorted(
-        set(alphabet) | set(lo) | set(hi or "") | set(first or "") | set(prefix),
-        key=order,
-    )
-    digit = {c: i + 1 for i, c in enumerate(chars)}
-    base = len(chars) + 1
-    width = max(len(lo), len(hi or ""), len(first or ""), len(prefix)) + 1
-
-    def value(key: str) -> int:
-        n = 0
-        for i in range(width):
-            n = n * base + (digit[key[i]] if i < len(key) else 0)
-        return n
-
-    end = value(prefix) + base ** (width - len(prefix)) if hi is None else value(hi)
-    n = (value(lo) + end) // 2
-    if first is not None and order(first) < order(lo):
-        n = min(n, value(lo) + (value(lo) - value(first)) * pages)
-    digits = []
-    for _ in range(width):
-        n, d = divmod(n, base)
-        digits.append(chars[max(d - 1, 0)])
-    mid = "".join(reversed(digits))
-    mid = next(
-        (mid[:k] for k in range(1, len(mid) + 1) if order(mid[:k]) > order(lo)), mid
-    )
-    inside = order(lo) < order(mid) and (hi is None or order(mid) < order(hi))
-    return mid if inside and mid.startswith(prefix) else None
 
 
 def get_cloud_schemes() -> list[str]:
@@ -195,12 +97,6 @@ class Client(ABC):
     # client_config keys this backend treats as credentials.
     CREDENTIAL_KEYS: ClassVar[frozenset[str]] = frozenset()
     LIST_PAGE_SIZE: ClassVar[int] = 1000
-    PROBE_BOUNDED_SPLITS: ClassVar[bool] = True  # pays off with large pages
-
-    @staticmethod
-    def key_order(key: str) -> Any:
-        """The sort key of the order the server lists keys in."""
-        return key
 
     @classmethod
     def has_explicit_credentials(cls, client_config: dict | None) -> bool:
@@ -432,7 +328,10 @@ class Client(ABC):
             impl = getattr(self, f"_fetch_{method}")
         except AttributeError:
             raise ValueError(f"Unknown indexing method '{method}'") from None
-        if processes and getattr(impl, "__func__", None) is Client._fetch_ranges:
+        if (
+            processes
+            and getattr(impl, "__func__", None) is RangeListedClient._fetch_ranges
+        ):
             impl = functools.partial(impl, processes=True)
         result_queue: ResultQueue = asyncio.Queue(2 * LIST_WORKERS)
 
@@ -490,240 +389,6 @@ class Client(ABC):
                 worker.cancel()
             await asyncio.gather(*workers, return_exceptions=True)
             progress_bar.close()
-
-    async def _fetch_ranges(  # noqa: C901, PLR0915
-        self,
-        start_prefix: str,
-        result_queue: ResultQueue,
-        processes: bool = False,
-    ) -> None:
-        """List key ranges ``(lo, hi]`` in parallel; while a worker is idle, a
-        busy range hands over its upper half, split at a key midpoint. A young
-        range splits close ahead, so a small listing stays a few requests. With
-        ``processes``, a listing longer than a page moves to child processes."""
-        from .listing_worker import PROCESSES, ChildDied, Pool
-
-        prefix = start_prefix.lstrip(DELIMITER) + DELIMITER if start_prefix else ""
-        # (lo, hi, pages read by the ranges this one split off from)
-        queue: asyncio.Queue[tuple[str, str | None, int]] = asyncio.Queue()
-        queue.put_nowait(("", None, 0))
-        alphabet: set[str] = set()
-        order = self.key_order
-        open_ranges, found, seeks = 1, False, True
-        pool = Pool(self, prefix, PROCESSES) if processes else None
-        in_flight = PROCESS_LIST_WORKERS if pool and pool.size else LIST_WORKERS
-        local = asyncio.Semaphore(LIST_WORKERS)  # requests from this process
-        probes: set[asyncio.Task] = set()
-        pbar = tqdm(desc=f"Listing {self.uri}", unit=" objects", leave=False)
-
-        async def split(mid: str, bound: Bound) -> None:
-            """Open ``(mid, hi]`` if a probe finds a key there. If not, the range
-            ends at ``mid`` and splits where its keys are dense instead: keys
-            that cluster leave most midpoints empty."""
-            nonlocal open_ranges
-            try:
-                async with local:
-                    key: str | None = await self._probe(prefix, mid)
-            except Exception:  # errors come from many libraries
-                logger.debug("Split probe failed, splitting unprobed", exc_info=True)
-                key = mid
-            finally:
-                bound.probing = False
-            hi = bound.hi
-            if (
-                bound.done
-                or order(bound.last or "") >= order(mid)
-                or not bound.keeps(mid)
-            ):
-                open_ranges -= 1  # the range got there first
-            elif key is None or not bound.keeps(key):
-                bound.shrink(mid)  # nothing past mid: no empty range to read
-                dense = key_midpoint(
-                    bound.last or "", mid, alphabet, bound.first, order=order
-                )
-                if bound.first is not None and dense is not None:
-                    queue.put_nowait((dense, mid, bound.pages))
-                    bound.shrink(dense)
-                else:
-                    open_ranges -= 1
-            else:
-                queue.put_nowait((mid, hi, bound.pages))
-                bound.shrink(mid)
-
-        async def read(lo: str, hi: str | None, age: int) -> None:
-            bound = Bound(hi, order)
-            bound.pages = age
-            try:
-                await read_pages_of(lo, bound)
-            finally:
-                bound.done = True
-
-        async def fetch(lo: str, token: Any, bound: Bound) -> Page:
-            while pool and pool.ready():
-                with suppress(ChildDied):
-                    return await pool.list_page(prefix, lo, token, bound.hi)
-            async with local:
-                return await self._list_page(
-                    prefix, lo, token, self._keeps(bound.hi), hi=bound.hi
-                )
-
-        async def read_pages_of(lo: str, bound: Bound) -> None:
-            nonlocal open_ranges, found, seeks
-            can_split = bool(lo)  # a one-page listing stays one request
-            lo_key = order(lo)
-            page = await fetch(lo, None, bound)
-            next_page: asyncio.Task | None = None
-            try:
-                while True:
-                    bound.pages += 1
-                    last, token = page.last, page.token
-                    # splits follow the keys kept; any object makes the prefix found
-                    first = page.rows[0].path if page.rows else None
-                    if last is not None:  # before the put: a probe may return meanwhile
-                        bound.last = max(bound.last or last, last, key=order)
-                        bound.first = first
-                    if first is not None and order(first) < lo_key:
-                        seeks = False  # the server ignores the start
-                    found = found or page.first is not None
-                    # GCS startOffset and Azure start_from include the start key
-                    files = [
-                        f
-                        for f in page.rows
-                        if bound.keeps(f.path) and order(f.path) > lo_key
-                    ]
-                    if last is not None and not bound.keeps(last):
-                        token = None
-                    elif last is not None and order(last) > lo_key:
-                        alphabet.update(last)
-                        ordered = seeks and self._lists_in_key_order()
-                        if token is not None and ordered:
-                            if pool and (lo or bound.pages > 1):
-                                pool.start()  # more than a page: worth a process
-                            if can_split and not bound.probing:
-                                maybe_split(bound, last, first)
-                        can_split = True
-                    if token is not None:
-                        next_page = asyncio.create_task(fetch(lo, token, bound))
-                    if files:
-                        await result_queue.put(files)
-                        pbar.update(len(files))
-                    if next_page is None:
-                        return
-                    page, next_page = await next_page, None
-            finally:
-                if next_page is not None:
-                    next_page.cancel()
-                    await asyncio.gather(next_page, return_exceptions=True)
-
-        def maybe_split(bound: Bound, last: str, first: str | None):
-            """With an open end, an old range splits at most pages squared ahead:
-            a small listing stays near its keys and a large one soon reaches its
-            end."""
-            nonlocal open_ranges
-            if open_ranges >= in_flight:
-                return
-            young = bound.pages <= YOUNG_PAGES
-            if young:
-                mid = key_midpoint(
-                    last, bound.hi, alphabet, first, SPLIT_PAGES, prefix, order
-                )
-            elif bound.hi is None:
-                mid = key_midpoint(
-                    last, None, alphabet, first, bound.pages**2, prefix, order
-                )
-            else:
-                mid = key_midpoint(
-                    last, bound.hi, alphabet, None, SPLIT_PAGES, prefix, order
-                )
-            if mid is None:
-                return
-            open_ranges += 1
-            unprobed = bound.hi is not None and not self.PROBE_BOUNDED_SPLITS
-            if young or unprobed:
-                queue.put_nowait((mid, bound.hi, bound.pages))
-                bound.shrink(mid)
-            else:
-                bound.probing = True
-                probes.add(task := asyncio.create_task(split(mid, bound)))
-                task.add_done_callback(probes.discard)
-
-        async def worker() -> None:
-            nonlocal open_ranges
-            while True:
-                lo, hi, age = await queue.get()
-                try:
-                    await read(lo, hi, age)
-                finally:
-                    open_ranges -= 1
-                    queue.task_done()
-
-        workers = [asyncio.create_task(worker()) for _ in range(in_flight)]
-        done = asyncio.create_task(queue.join())
-        try:
-            await asyncio.wait([done, *workers], return_when=asyncio.FIRST_COMPLETED)
-            if failed := next((w for w in workers if w.done()), None):
-                await failed
-            if not found and prefix:
-                raise FileNotFoundError(f"Unable to resolve remote path: {prefix}")
-        finally:
-            tasks = [done, *workers, *probes]
-            for task in tasks:
-                task.cancel()
-            await asyncio.gather(*tasks, return_exceptions=True)
-            if pool:
-                pool.close()
-            pbar.close()
-
-    def _lists_in_key_order(self) -> bool:
-        return True
-
-    def _keeps(self, hi: str | None) -> Callable[[str], bool]:
-        if hi is None:
-            return self._is_valid_key
-        hi_key = self.key_order(hi)
-        order = self.key_order
-        return lambda key: self._is_valid_key(key) and order(key) <= hi_key
-
-    async def _list_page(
-        self,
-        prefix: str,
-        start_after: str,
-        token: Any,
-        keep: Callable[[str], bool],
-        page_size: int | None = None,
-        hi: str | None = None,
-    ) -> Page:
-        """One page under ``prefix``, in key order: the one after ``token``, or
-        the first after ``start_after``. Only keys to ``keep`` become rows. A
-        backend that can end a listing at a key ends it after ``hi``."""
-        raise NotImplementedError
-
-    async def _pages_after(
-        self,
-        prefix: str,
-        start_after: str,
-        keep: Callable[[str], bool],
-        page_size: int | None = None,
-        hi: str | None = None,
-    ) -> AsyncIterator[Page]:
-        token = None
-        while True:
-            page = await self._list_page(
-                prefix, start_after, token, keep, page_size=page_size, hi=hi
-            )
-            yield page
-            if (token := page.token) is None:
-                return
-
-    async def _probe(self, prefix: str, start_after: str) -> str | None:
-        """The first key after ``start_after``, of any kind, even a delete marker;
-        ``None`` only when the listing ends there."""
-        pages = self._pages_after(prefix, start_after, lambda _: False, page_size=1)
-        async with aclosing(pages):  # type: ignore[type-var]
-            async for page in pages:
-                if page.last is not None:  # a page may be empty and still not the last
-                    return page.last
-        return None
 
     async def _fetch_default(
         self, start_prefix: str, result_queue: ResultQueue
@@ -975,3 +640,79 @@ class Client(ABC):
                     "update=True to refresh the catalog."
                 )
         await self.cache.download(file, self, callback=callback)
+
+
+class RangeListedClient(Client):
+    """A client that lists in parallel key ranges (``RangeListing``)."""
+
+    PROBE_BOUNDED_SPLITS: ClassVar[bool] = True  # pays off with large pages
+
+    @staticmethod
+    def key_order(key: str) -> Any:
+        """The sort key of the order the server lists keys in."""
+        return key
+
+    async def _fetch_ranges(
+        self,
+        start_prefix: str,
+        result_queue: ResultQueue,
+        processes: bool = False,
+    ) -> None:
+        from .listing_worker import LIST_PROCESSES, Pool
+
+        prefix = start_prefix.lstrip(DELIMITER) + DELIMITER if start_prefix else ""
+        pool = Pool(self, prefix, LIST_PROCESSES) if processes else None
+        await RangeListing(self, prefix, result_queue, pool).run()
+
+    _fetch_default = _fetch_ranges
+
+    def _lists_in_key_order(self) -> bool:
+        return True
+
+    def _keeps(self, hi: str | None) -> Callable[[str], bool]:
+        if hi is None:
+            return self._is_valid_key
+        hi_key = self.key_order(hi)
+        order = self.key_order
+        return lambda key: self._is_valid_key(key) and order(key) <= hi_key
+
+    async def _list_page(
+        self,
+        prefix: str,
+        start_after: str,
+        token: Any,
+        keep: Callable[[str], bool],
+        page_size: int | None = None,
+        hi: str | None = None,
+    ) -> Page:
+        """One page under ``prefix``, in key order: the one after ``token``, or
+        the first after ``start_after``. Only keys to ``keep`` become rows. A
+        backend that can end a listing at a key ends it after ``hi``."""
+        raise NotImplementedError
+
+    async def _pages_after(
+        self,
+        prefix: str,
+        start_after: str,
+        keep: Callable[[str], bool],
+        page_size: int | None = None,
+        hi: str | None = None,
+    ) -> AsyncIterator[Page]:
+        token = None
+        while True:
+            page = await self._list_page(
+                prefix, start_after, token, keep, page_size=page_size, hi=hi
+            )
+            yield page
+            if (token := page.token) is None:
+                return
+
+    async def _probe(self, prefix: str, start_after: str) -> str | None:
+        """The first key after ``start_after``, of any kind, even a delete marker;
+        ``None`` only when the listing ends there."""
+        pages = self._pages_after(prefix, start_after, lambda _: False, page_size=1)
+        async with aclosing(pages):  # type: ignore[type-var]
+            async for page in pages:
+                if page.last is not None:  # a page may be empty and still not the last
+                    return page.last
+        return None
