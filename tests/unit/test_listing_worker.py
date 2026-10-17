@@ -1,5 +1,6 @@
 import asyncio
 import io
+import logging
 import os
 import pickle
 import random
@@ -404,3 +405,24 @@ def test_s3_connections_cover_the_listing_requests_in_flight():
 
     assert fs.config_kwargs["max_pool_connections"] >= PROCESS_LIST_WORKERS
     assert mine.config_kwargs["max_pool_connections"] == 5
+
+
+@pytest.mark.parametrize("level, logged", [("DEBUG", True), ("WARNING", False)])
+def test_child_logs_at_the_parents_level(level, logged, tmp_path):
+    from datachain.client.local import FileClient
+
+    spec = dump(
+        (FileClient, str(tmp_path), {}, None, 4, "", logging.getLevelName(level))
+    )
+    code = "from datachain.client.listing_worker import main; main()"
+    out = subprocess.run(  # noqa: S603
+        [sys.executable, "-c", code],
+        input=spec,
+        capture_output=True,
+        timeout=60,
+        check=False,
+        env={**os.environ, "PYTHONPATH": ROOT},
+    )
+
+    assert out.returncode == 0
+    assert (b"Listing process warm-up failed" in out.stderr) is logged

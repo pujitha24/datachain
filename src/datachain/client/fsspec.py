@@ -530,8 +530,9 @@ class Client(ABC):
             try:
                 async with local:
                     key: str | None = await self._probe(prefix, mid)
-            except Exception:  # noqa: BLE001
-                key = mid  # split unprobed
+            except Exception:  # errors come from many libraries
+                logger.debug("Split probe failed, splitting unprobed", exc_info=True)
+                key = mid
             finally:
                 bound.probing = False
             hi = bound.hi
